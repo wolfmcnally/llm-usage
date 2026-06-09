@@ -1,0 +1,720 @@
+#!/usr/bin/env python3
+"""
+llm-usage — terminal dashboard for Anthropic + OpenAI subscription rate limits.
+
+Pulls the same numbers Claude Code's `/usage` and Codex CLI report, sized to the
+current terminal. Each row shows:
+    colored bar  = % of the limit consumed
+    ▼ above the bar = % of the time window elapsed (i.e. *now*)
+The relationship between the two is the actual signal, and the ▼ is colored
+to match the over/under/on-pace verdict:
+    bar ends past the ▼   → over-pace (red ▼), will hit the limit early
+    bar ends before the ▼ → under-pace (green ▼), headroom available
+    bar ends under the ▼  → on-pace (white ▼)
+
+Tokens are loaded in this order:
+
+  Anthropic OAuth:
+      1. $CLAUDE_CODE_OAUTH_TOKEN
+      2. macOS Keychain entry "Claude Code-credentials"
+      3. ~/.claude/.credentials.json
+
+  OpenAI/Codex OAuth:
+      1. $CODEX_OAUTH_TOKEN
+      2. ~/.codex/auth.json
+
+Token expiry is reported for both providers: Anthropic from the credential
+store's expiresAt, OpenAI from the access token's JWT `exp` claim (decoded
+locally, never verified — inspection only).
+
+Each provider section renders independently: a missing token, expired
+credential, network failure, or API error for one provider degrades to an
+inline error line in that section while the other still renders fully.
+
+Exit codes: 0 = both providers OK, 1 = one provider failed, 2 = both failed.
+
+Caching: each successful API response is cached on disk per provider, and a
+subsequent run within the TTL (default 600s = 10 minutes) is served from that
+cache without touching the network — so the real endpoints are hit at most once
+every ten minutes no matter how often you run this. Failed fetches are never
+cached, so a transient error retries immediately on the next run. When a section
+is served from cache, it's annotated with the cache age. Override with the
+LLM_USAGE_CACHE_TTL env var (seconds; 0 disables), or bypass for a single run
+with --fresh / --no-cache. Cache lives under $XDG_CACHE_HOME/llm-usage
+(default ~/.cache/llm-usage).
+
+No third-party dependencies — stdlib only. The provider SDKs do not expose
+these endpoints; both vendor CLIs hit them directly, and so do we.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from typing import Any
+
+# ---------------------------------------------------------------- ANSI ----
+
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+
+
+def fg256(n: int) -> str:
+    return f"\033[38;5;{n}m"
+
+
+WHITE = "\033[97m"
+DIM_GRAY = fg256(238)
+SUB_FG = fg256(245)
+RULE_FG = fg256(240)
+
+
+def color_for_pct(p: float) -> str:
+    if p < 50:
+        return fg256(78)   # green
+    if p < 75:
+        return fg256(186)  # yellow
+    if p < 90:
+        return fg256(214)  # orange
+    return fg256(203)      # red
+
+
+def visible_len(s: str) -> int:
+    return len(re.sub(r"\033\[[0-9;]*m", "", s))
+
+
+# ----------------------------------------------------- token loaders ----
+
+def jwt_claims(token: str | None) -> dict | None:
+    """Decode a JWT payload without verification — local expiry inspection
+    only, never trust-establishing."""
+    if not token or token.count(".") != 2:
+        return None
+    payload = token.split(".")[1]
+    payload += "=" * (-len(payload) % 4)
+    try:
+        return json.loads(base64.urlsafe_b64decode(payload))
+    except Exception:
+        return None
+
+
+def load_anthropic_token() -> dict | None:
+    if t := os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        return {"access_token": t, "expires_at_ms": None,
+                "subscription": None, "org": None}
+    user = os.environ.get("USER", "")
+    if user:
+        try:
+            out = subprocess.check_output(
+                ["security", "find-generic-password",
+                 "-s", "Claude Code-credentials",
+                 "-a", user, "-w"],
+                stderr=subprocess.DEVNULL,
+            ).decode().strip()
+            d = json.loads(out)
+            c = d.get("claudeAiOauth", {})
+            return {
+                "access_token": c.get("accessToken"),
+                "expires_at_ms": c.get("expiresAt"),
+                "subscription": c.get("subscriptionType"),
+                "org": d.get("organizationUuid"),
+            }
+        except (subprocess.CalledProcessError, json.JSONDecodeError):
+            pass
+    p = os.path.expanduser("~/.claude/.credentials.json")
+    if os.path.exists(p):
+        try:
+            with open(p) as f:
+                d = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return None
+        c = d.get("claudeAiOauth", {})
+        return {
+            "access_token": c.get("accessToken"),
+            "expires_at_ms": c.get("expiresAt"),
+            "subscription": c.get("subscriptionType"),
+            "org": d.get("organizationUuid"),
+        }
+    return None
+
+
+def load_codex_token() -> dict | None:
+    tok: dict | None = None
+    if t := os.environ.get("CODEX_OAUTH_TOKEN"):
+        tok = {"access_token": t, "account_id": None}
+    else:
+        p = os.path.expanduser("~/.codex/auth.json")
+        if os.path.exists(p):
+            try:
+                with open(p) as f:
+                    d = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                return None
+            toks = d.get("tokens", {}) or {}
+            tok = {
+                "access_token": toks.get("access_token"),
+                "account_id": toks.get("account_id"),
+                "auth_mode": d.get("auth_mode"),
+            }
+    if tok:
+        # Codex access tokens are JWTs; the exp claim is the OAuth expiry.
+        claims = jwt_claims(tok.get("access_token")) or {}
+        exp = claims.get("exp")
+        tok["expires_at_ms"] = exp * 1000 if isinstance(exp, (int, float)) \
+            else None
+    return tok
+
+
+# ---------------------------------------------------------------- HTTP ----
+
+def http_get_json(url: str, headers: dict, timeout: int = 15
+                  ) -> tuple[int | None, Any]:
+    req = urllib.request.Request(url, method="GET", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read().decode())
+        except Exception:
+            body = {"error": "http", "code": e.code}
+        return e.code, body
+    except Exception as e:
+        return None, {"error": str(e)}
+
+
+def fetch_anthropic(tok: dict) -> tuple[int | None, Any]:
+    return http_get_json(
+        "https://api.anthropic.com/api/oauth/usage",
+        {
+            "Authorization": f"Bearer {tok['access_token']}",
+            "User-Agent": "claude-cli/1.0 (external, cli)",
+            "anthropic-beta": "oauth-2025-04-20",
+        },
+    )
+
+
+def fetch_codex(tok: dict) -> tuple[int | None, Any]:
+    headers = {
+        "Authorization": f"Bearer {tok['access_token']}",
+        "User-Agent": "codex_cli_rs/0.45.0 (macOS; arm64)",
+        "Originator": "codex_cli_rs",
+        "Accept": "application/json",
+    }
+    if tok.get("account_id"):
+        headers["Chatgpt-Account-Id"] = tok["account_id"]
+    return http_get_json(
+        "https://chatgpt.com/backend-api/wham/usage", headers)
+
+
+# --------------------------------------------------------------- cache ----
+#
+# The undocumented usage endpoints are rate-limited and return transient 429s
+# under load, so we hit them at most once per TTL window (default 10 minutes)
+# per provider. Each *successful* (HTTP 200) response is written to a small
+# per-provider JSON file; any run within the TTL reuses it without a network
+# call. Failures are never cached, so an error retries on the very next run
+# rather than being pinned for ten minutes. Both the TUI and --json paths share
+# the cache via cached_fetch().
+
+DEFAULT_CACHE_TTL = 600  # seconds — "at most once every ten minutes"
+_CACHE_ENABLED = True     # flipped off by --fresh/--no-cache or env
+
+
+def cache_ttl() -> int:
+    """Effective cache TTL in seconds; 0 (or negative) disables caching."""
+    if not _CACHE_ENABLED:
+        return 0
+    raw = os.environ.get("LLM_USAGE_CACHE_TTL")
+    if raw is None:
+        return DEFAULT_CACHE_TTL
+    try:
+        return int(raw)
+    except ValueError:
+        return DEFAULT_CACHE_TTL
+
+
+def _cache_dir() -> str:
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    return os.path.join(base, "llm-usage")
+
+
+def _cache_path(provider: str) -> str:
+    return os.path.join(_cache_dir(), f"{provider}.json")
+
+
+def cache_read(provider: str, ttl: int) -> tuple[int | None, Any, float] | None:
+    """Return (code, body, age_seconds) for a fresh cache entry, else None."""
+    if ttl <= 0:
+        return None
+    try:
+        with open(_cache_path(provider)) as f:
+            d = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    ts = d.get("ts")
+    if not isinstance(ts, (int, float)):
+        return None
+    age = time.time() - ts
+    if age < 0 or age > ttl:
+        return None
+    return d.get("code"), d.get("body"), age
+
+
+def cache_write(provider: str, code: int | None, body: Any) -> None:
+    """Persist a fetch result. Best-effort: cache I/O never breaks a run."""
+    path = _cache_path(provider)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        os.makedirs(_cache_dir(), exist_ok=True)
+        with open(tmp, "w") as f:
+            json.dump({"ts": time.time(), "code": code, "body": body}, f)
+        os.replace(tmp, path)  # atomic — concurrent runs never see a partial
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def cached_fetch(provider: str, fetch_fn, tok: dict
+                 ) -> tuple[int | None, Any, float | None]:
+    """Fetch with a per-provider TTL cache.
+
+    Returns (code, body, cache_age): cache_age is None for a live network
+    call, or the age in seconds of the served cache entry. Only HTTP 200
+    responses are cached; everything else falls through to a live call next
+    time so transient errors don't get pinned for the whole TTL.
+    """
+    ttl = cache_ttl()
+    hit = cache_read(provider, ttl)
+    if hit is not None:
+        code, body, age = hit
+        return code, body, age
+    code, body = fetch_fn(tok)
+    if code == 200:
+        cache_write(provider, code, body)
+    return code, body, None
+
+
+def cache_note(age: float | None) -> None:
+    """Print a dim 'served from cache' annotation when age is not None."""
+    if age is None:
+        return
+    print(f"  {DIM}↻ cached {fmt_relative(age)} ago "
+          f"(refreshes after {fmt_relative(cache_ttl())}){RESET}")
+
+
+# ----------------------------------------------------------- bar render ----
+
+FULL = "█"
+EMPTY = "░"
+NOW_MARK = "▼"
+
+
+def render_bar(width: int, usage_pct: float) -> tuple[str, bool]:
+    """Return (bar_string, overflow). Width is total cells."""
+    width = max(width, 4)
+    overflow = usage_pct > 100
+    fill_cells = round(min(max(0, usage_pct), 100) / 100 * width)
+    color = color_for_pct(usage_pct)
+    cells = []
+    for i in range(width):
+        if i < fill_cells:
+            cells.append(color + FULL + RESET)
+        else:
+            cells.append(DIM_GRAY + EMPTY + RESET)
+    return "".join(cells), overflow
+
+
+# ---------------------------------------------------------- time helpers ----
+
+def parse_iso(s: str | None) -> datetime | None:
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def fmt_local(dt: datetime | None) -> str:
+    if not dt:
+        return "—"
+    return dt.astimezone().strftime("%a %b %d %H:%M %Z")
+
+
+def fmt_relative(seconds: float | None) -> str:
+    if seconds is None:
+        return "—"
+    s = int(max(0, seconds))
+    d, rem = divmod(s, 86400)
+    h, rem = divmod(rem, 3600)
+    m, _ = divmod(rem, 60)
+    if d:
+        return f"{d}d {h}h"
+    if h:
+        return f"{h}h {m:02d}m"
+    return f"{m}m"
+
+
+def fmt_window(seconds: int) -> str:
+    if seconds % 86400 == 0 and seconds >= 86400:
+        d = seconds // 86400
+        return f"{d}-day" if d > 1 else "1-day"
+    if seconds % 3600 == 0:
+        h = seconds // 3600
+        return f"{h}-hour"
+    return f"{seconds}s"
+
+
+# ------------------------------------------------------------------ row ----
+
+def row(label: str, usage_pct: float, now_pct: float | None,
+        reset_dt: datetime | None, reset_seconds: float | None,
+        width: int, label_w: int = 18) -> str:
+    pct_str = f"{usage_pct:4.0f}%"
+    bar_w = max(8, width - label_w - len(pct_str) - 2)
+    bar, overflow = render_bar(bar_w, usage_pct)
+    lbl = f"{BOLD}{label:<{label_w}}{RESET}"
+    pct_color = color_for_pct(usage_pct)
+    overflow_mark = f" {fg256(203)}↑{RESET}" if overflow else "  "
+    line1 = f"{lbl}{bar}{overflow_mark}{pct_color}{pct_str}{RESET}"
+
+    line0 = ""
+    pace = ""
+    if now_pct is not None:
+        margin = usage_pct - now_pct
+        if usage_pct >= now_pct + 5:
+            pace_color = fg256(203)
+            pace = f"   {pace_color}↑ {margin:+.0f}pp over pace{RESET}"
+        elif usage_pct <= now_pct - 5:
+            pace_color = fg256(78)
+            pace = f"   {pace_color}↓ {margin:+.0f}pp under pace{RESET}"
+        else:
+            pace_color = WHITE
+            pace = f"   {pace_color}≈ on pace{RESET}"
+        now_idx = min(max(0, round(now_pct / 100 * bar_w)), bar_w - 1)
+        line0 = " " * (label_w + now_idx) + pace_color + NOW_MARK + RESET
+
+    parts = []
+    if reset_dt:
+        parts.append(f"resets {fmt_local(reset_dt)}")
+    if reset_seconds is not None:
+        parts.append(f"in {fmt_relative(reset_seconds)}")
+    if now_pct is not None:
+        parts.append(f"window {now_pct:.0f}% elapsed")
+    if not parts and not pace:
+        return line0 + "\n" + line1
+    sub = SUB_FG + "  ·  ".join(parts) + RESET + pace
+    line2 = f"{' ' * label_w}{sub}"
+    return line0 + "\n" + line1 + "\n" + line2
+
+
+# -------------------------------------------------------------- header ----
+
+def section_header(title: str, plan: str, width: int) -> None:
+    left = f"{BOLD}{title}{RESET}"
+    if plan:
+        left += f"  {DIM}{plan}{RESET}"
+    now_str = datetime.now().astimezone().strftime("%a %b %d %H:%M %Z")
+    pad = width - visible_len(left) - len(now_str)
+    pad = max(1, pad)
+    print(left + " " * pad + DIM + now_str + RESET)
+    print(RULE_FG + "─" * width + RESET)
+
+
+def warn_line(msg: str) -> None:
+    print(f"  {fg256(203)}✖ {msg}{RESET}")
+
+
+def print_token_expiry(expires_at_ms: int | None) -> bool:
+    """Print the OAuth-token-expiry line. Returns True if already expired."""
+    if expires_at_ms is None:
+        print(f"  {DIM}token expiry unknown{RESET}")
+        return False
+    exp = datetime.fromtimestamp(expires_at_ms / 1000, tz=timezone.utc)
+    secs = (exp - datetime.now(timezone.utc)).total_seconds()
+    if secs <= 0:
+        print(f"  {fg256(203)}✖ OAuth token expired {fmt_relative(-secs)} "
+              f"ago ({fmt_local(exp)}){RESET}")
+        return True
+    if secs < 3600:
+        prefix = f"{fg256(203)}⚠ "
+    elif secs < 7 * 86400:
+        prefix = f"{fg256(214)}⚠ "
+    else:
+        prefix = SUB_FG
+    print(f"  {prefix}OAuth token expires in {fmt_relative(secs)} "
+          f"({fmt_local(exp)}){RESET}")
+    return False
+
+
+# ------------------------------------------------------------- sections ----
+
+def anthropic_section(width: int) -> bool:
+    """Render the Anthropic section. Returns True on full success."""
+    tok = load_anthropic_token()
+    if not tok or not tok.get("access_token"):
+        section_header("ANTHROPIC", "Claude", width)
+        warn_line("no OAuth token "
+                  "(set $CLAUDE_CODE_OAUTH_TOKEN or run `claude` to login)")
+        return False
+
+    plan_label = (tok.get("subscription") or "").upper()
+    section_header("ANTHROPIC",
+                   f"Claude {plan_label} plan" if plan_label else "Claude",
+                   width)
+    expired = print_token_expiry(tok.get("expires_at_ms"))
+
+    code, a, age = cached_fetch("anthropic", fetch_anthropic, tok)
+    cache_note(age)
+    if code == 401:
+        warn_line("token rejected (401)"
+                  + (" — expired" if expired else "")
+                  + "; run `claude` to refresh")
+        return False
+    if code != 200:
+        warn_line(f"API error {code}: {json.dumps(a)[:200]}")
+        return False
+
+    print()
+    now = datetime.now(timezone.utc)
+    bands = [
+        ("7-day overall", a.get("seven_day"), 7 * 86400),
+        ("5-hour", a.get("five_hour"), 5 * 3600),
+        ("7-day Sonnet", a.get("seven_day_sonnet"), 7 * 86400),
+        ("7-day Opus", a.get("seven_day_opus"), 7 * 86400),
+        ("7-day OAuth apps", a.get("seven_day_oauth_apps"), 7 * 86400),
+        ("7-day cowork", a.get("seven_day_cowork"), 7 * 86400),
+    ]
+    printed = 0
+    for label, data, window_s in bands:
+        if not data:
+            continue
+        usage = float(data.get("utilization", 0))
+        reset_dt = parse_iso(data.get("resets_at"))
+        if reset_dt:
+            rem = (reset_dt - now).total_seconds()
+            now_pct = max(0.0, min(100.0, (window_s - rem) / window_s * 100))
+        else:
+            rem = None
+            now_pct = None
+        print(row(label, usage, now_pct, reset_dt, rem, width))
+        printed += 1
+    if not printed:
+        print(f"  {DIM}(no usage data){RESET}")
+    return True
+
+
+def openai_section(width: int) -> bool:
+    """Render the OpenAI section. Returns True on full success."""
+    tok = load_codex_token()
+    if not tok or not tok.get("access_token"):
+        section_header("OPENAI", "ChatGPT", width)
+        warn_line("no OAuth token "
+                  "(set $CODEX_OAUTH_TOKEN or run `codex` to login)")
+        return False
+
+    code, o, age = cached_fetch("openai", fetch_codex, tok)
+    plan = (o.get("plan_type") or "").title() if code == 200 else ""
+    section_header("OPENAI",
+                   f"ChatGPT {plan} plan" if plan else "ChatGPT", width)
+    expired = print_token_expiry(tok.get("expires_at_ms"))
+    cache_note(age)
+
+    if code == 401:
+        warn_line("token rejected (401)"
+                  + (" — expired" if expired else "")
+                  + "; run `codex` to refresh")
+        return False
+    if code != 200:
+        warn_line(f"API error {code}: {json.dumps(o)[:200]}")
+        return False
+
+    print()
+    rl = o.get("rate_limit") or {}
+    if rl.get("limit_reached"):
+        print(f"  {fg256(203)}● limit reached — requests will be rejected"
+              f"{RESET}")
+    elif not rl.get("allowed", True):
+        print(f"  {fg256(214)}⚠ requests not currently allowed{RESET}")
+
+    printed = 0
+    # Weekly (secondary) window first — it's the limit that matters most.
+    for key, default_label in [
+        ("secondary_window", "secondary"),
+        ("primary_window", "primary"),
+    ]:
+        w = rl.get(key)
+        if not w:
+            continue
+        usage = float(w.get("used_percent", 0))
+        wnd_s = w.get("limit_window_seconds")
+        rem_s = w.get("reset_after_seconds")
+        if wnd_s and rem_s is not None:
+            now_pct = max(0.0, min(100.0,
+                                   (wnd_s - rem_s) / wnd_s * 100))
+        else:
+            now_pct = None
+        reset_at = w.get("reset_at")
+        reset_dt = (datetime.fromtimestamp(reset_at, tz=timezone.utc)
+                    if reset_at else None)
+        label = fmt_window(wnd_s) if wnd_s else default_label
+        if key == "secondary_window":
+            label = f"{label} (weekly)"
+        print(row(label, usage, now_pct, reset_dt, rem_s, width))
+        printed += 1
+    if not printed:
+        print(f"  {DIM}(no usage data){RESET}")
+    return True
+
+
+# ------------------------------------------------------------ json output ----
+#
+# `--json` emits a machine-readable snapshot for schedulers (e.g. bin/checkpoint)
+# that route work to whichever subscription has the most headroom. Both providers
+# are normalized to a uniform shape: each relevant window reports `utilization`
+# as a percent (0-100) plus seconds-until-reset. The TUI path is untouched.
+
+def _anthropic_json() -> dict:
+    tok = load_anthropic_token()
+    if not tok or not tok.get("access_token"):
+        return {"ok": False, "error": "no OAuth token", "windows": {},
+                "cached": False, "cache_age_seconds": None}
+    code, a, age = cached_fetch("anthropic", fetch_anthropic, tok)
+    if code != 200:
+        return {"ok": False, "error": f"API error {code}", "windows": {},
+                "cached": age is not None, "cache_age_seconds": age}
+    now = datetime.now(timezone.utc)
+    windows: dict[str, Any] = {}
+    for key in ("seven_day", "five_hour"):
+        d = a.get(key)
+        if not d:
+            continue
+        reset_dt = parse_iso(d.get("resets_at"))
+        rem = (reset_dt - now).total_seconds() if reset_dt else None
+        windows[key] = {
+            "utilization": float(d.get("utilization", 0)),
+            "resets_at": d.get("resets_at"),
+            "reset_seconds": rem,
+        }
+    return {"ok": True, "error": None,
+            "subscription": tok.get("subscription"), "windows": windows,
+            "cached": age is not None, "cache_age_seconds": age}
+
+
+def _openai_json() -> dict:
+    tok = load_codex_token()
+    if not tok or not tok.get("access_token"):
+        return {"ok": False, "error": "no OAuth token", "windows": {},
+                "cached": False, "cache_age_seconds": None}
+    code, o, age = cached_fetch("openai", fetch_codex, tok)
+    if code != 200:
+        return {"ok": False, "error": f"API error {code}", "windows": {},
+                "cached": age is not None, "cache_age_seconds": age}
+    rl = o.get("rate_limit") or {}
+    windows: dict[str, Any] = {}
+    for key in ("secondary_window", "primary_window"):
+        w = rl.get(key)
+        if not w:
+            continue
+        windows[key] = {
+            "utilization": float(w.get("used_percent", 0)),
+            "reset_seconds": w.get("reset_after_seconds"),
+            "reset_at": w.get("reset_at"),
+        }
+    return {"ok": True, "error": None,
+            "plan": o.get("plan_type"),
+            "limit_reached": bool(rl.get("limit_reached")),
+            "windows": windows,
+            "cached": age is not None, "cache_age_seconds": age}
+
+
+def emit_json() -> int:
+    a = _anthropic_json()
+    o = _openai_json()
+    print(json.dumps({"anthropic": a, "openai": o}, indent=2))
+    return 0 if (a["ok"] and o["ok"]) else (1 if (a["ok"] or o["ok"]) else 2)
+
+
+# ----------------------------------------------------------------- main ----
+
+def parse_cache_flags() -> None:
+    """Honor --fresh/--no-cache and LLM_USAGE_NO_CACHE before any fetch."""
+    global _CACHE_ENABLED
+    args = sys.argv[1:]
+    if "--fresh" in args or "--no-cache" in args:
+        _CACHE_ENABLED = False
+    if os.environ.get("LLM_USAGE_NO_CACHE"):
+        _CACHE_ENABLED = False
+
+
+def main() -> None:
+    parse_cache_flags()
+    if "--json" in sys.argv[1:]:
+        sys.exit(emit_json())
+
+    width = shutil.get_terminal_size((100, 24)).columns
+    width = min(max(width, 60), 140)
+
+    legend_used = (
+        f"{DIM}Used:{RESET} "
+        f"{fg256(78)}{FULL}{RESET} ok  "
+        f"{fg256(186)}{FULL}{RESET} 50%  "
+        f"{fg256(214)}{FULL}{RESET} 75%  "
+        f"{fg256(203)}{FULL}{RESET} 90%"
+    )
+    legend_pace = (
+        f"{DIM}Pace:{RESET} "
+        f"{fg256(78)}{NOW_MARK}{RESET} under  "
+        f"{WHITE}{NOW_MARK}{RESET} on  "
+        f"{fg256(203)}{NOW_MARK}{RESET} over"
+    )
+    print()
+    print(legend_used)
+    print(legend_pace)
+    print()
+    a_ok = anthropic_section(width)
+    print()
+    print(RULE_FG + "═" * width + RESET)
+    print()
+    o_ok = openai_section(width)
+    print()
+
+    if not (a_ok and o_ok):
+        sys.exit(1 if (a_ok or o_ok) else 2)
+
+
+if __name__ == "__main__":
+    code = 0
+    try:
+        main()
+    except KeyboardInterrupt:
+        code = 130
+    except SystemExit as e:
+        code = e.code if isinstance(e.code, int) else 0
+    except BrokenPipeError:
+        code = 141  # 128 + SIGPIPE, the conventional code
+    # Flush here, inside a guard: a downstream pipe (head, less quit early)
+    # closing otherwise raises an unhandled BrokenPipeError in the
+    # interpreter's exit flush.
+    try:
+        sys.stdout.flush()
+    except BrokenPipeError:
+        code = 141
+    if code == 141:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+    sys.exit(code)
