@@ -24,12 +24,22 @@ There is no lint/test command. Verify changes by running the script directly. No
 
 ## Caching
 
-To avoid hammering the undocumented (rate-limited) usage endpoints, every **successful** (HTTP 200) response is cached on disk per provider under `$XDG_CACHE_HOME/llm-usage` (default `~/.cache/llm-usage/{anthropic,openai}.json`). Any run within the TTL — default **600s (10 minutes)** — is served from that cache with **no network call**, so the real APIs are hit at most once every ten minutes per provider regardless of how often the script runs.
+To avoid hammering the undocumented (rate-limited) usage endpoints, responses are cached on disk per provider under `$XDG_CACHE_HOME/llm-usage` (default `~/.cache/llm-usage/{anthropic,openai}.json`). Two TTLs apply, keyed off the cached HTTP status (`cache_read` picks the TTL by the stored `code`):
 
-- **Failures are never cached** (`cached_fetch` only writes on `code == 200`), so a transient 429/network error retries on the very next run instead of being pinned for the whole window.
-- Cache served? The TUI prints a dim `↻ cached Nm ago` line under each section; `--json` adds `cached` (bool) and `cache_age_seconds` to each provider object.
-- **Overrides:** `LLM_USAGE_CACHE_TTL=<seconds>` (0 disables), or `--fresh` / `--no-cache` / `LLM_USAGE_NO_CACHE=1` to bypass for one run (still refreshes the cache on success).
-- Writes are atomic (`os.replace` of a pid-suffixed temp file) and entirely best-effort — cache I/O errors never break a render. Both the TUI and `--json` paths funnel through `cached_fetch`.
+- **Success (HTTP 200)** → cached for `cache_ttl()`, default **600s (10 min)**. Any run within the window is served with **no network call**, so the real APIs are hit at most once every ten minutes per provider.
+- **Rate-limit (HTTP 429)** → **negatively** cached for `rate_limit_ttl()`, default **1200s (20 min)**. Once a provider returns 429, `cached_fetch` writes that 429 and *no new call* is made for the backoff window — re-running the tool won't keep poking a limited endpoint. The section reports the backoff and time remaining instead.
+- **Any other failure** (401, 5xx, network `None`) is **never** cached (`cached_fetch` only writes on `code in (200, 429)`), so it retries on the very next run.
+
+Display / output:
+- TUI: a dim `↻ cached Nm ago` line for a cached 200; an orange `● rate limited (429) … retry in Nm` line (`rate_limit_warn`) for a cached or live 429.
+- `--json`: each provider object carries `cached` (bool), `cache_age_seconds`, and `rate_limited` (bool, present on the error path).
+
+Overrides:
+- `LLM_USAGE_CACHE_TTL=<seconds>` — success window; `0` (or ≤0) disables **all** caching (success *and* negative).
+- `LLM_USAGE_RATE_LIMIT_TTL=<seconds>` — 429 backoff window; independent of the success TTL.
+- `--fresh` / `--no-cache` / `LLM_USAGE_NO_CACHE=1` — bypass cache reads for one run (still refreshes the cache on a 200 or 429).
+
+Writes are atomic (`os.replace` of a pid-suffixed temp file) and entirely best-effort — cache I/O errors never break a render. Both the TUI and `--json` paths funnel through `cached_fetch`.
 
 ## Hard constraints
 

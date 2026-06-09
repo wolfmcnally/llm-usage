@@ -74,11 +74,12 @@ Tokens are read locally and sent only to the respective vendor's own API. OpenAI
 
 The undocumented usage endpoints are rate-limited, so `llm-usage` calls each provider's API **at most once every ten minutes**. Every successful response is cached on disk per provider; any run inside the TTL is served from cache with no network call and annotated `↻ cached Nm ago` under the section.
 
-- **TTL:** 600 seconds (10 minutes) by default. Override with `LLM_USAGE_CACHE_TTL=<seconds>` (set `0` to disable caching entirely).
-- **Bypass for one run:** `llm-usage --fresh` (alias `--no-cache`, or `LLM_USAGE_NO_CACHE=1`) hits the APIs live and refreshes the cache.
-- **Failures aren't cached** — a transient error retries on your next run rather than sticking around for ten minutes.
+- **Success TTL:** 600 seconds (10 minutes) by default. Override with `LLM_USAGE_CACHE_TTL=<seconds>` (set `0` to disable caching entirely).
+- **Rate-limit backoff:** if a provider returns **429**, that's *negatively* cached for **20 minutes** by default — the tool makes **no new call** to that provider for the whole window, so repeatedly running it won't keep poking a limited endpoint and prolong the block. The section shows `● rate limited (429) … retry in Nm` instead. Override with `LLM_USAGE_RATE_LIMIT_TTL=<seconds>`.
+- **Bypass for one run:** `llm-usage --fresh` (alias `--no-cache`, or `LLM_USAGE_NO_CACHE=1`) hits the APIs live and refreshes the cache — including overriding an active 429 backoff.
+- **Other failures aren't cached** — a 401/network error retries on your next run rather than sticking around.
 - **Location:** `$XDG_CACHE_HOME/llm-usage/` (default `~/.cache/llm-usage/`).
-- The `--json` output includes `cached` and `cache_age_seconds` per provider.
+- The `--json` output includes `cached`, `cache_age_seconds`, and `rate_limited` per provider.
 
 ## Failure behavior
 

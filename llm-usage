@@ -36,12 +36,17 @@ Exit codes: 0 = both providers OK, 1 = one provider failed, 2 = both failed.
 Caching: each successful API response is cached on disk per provider, and a
 subsequent run within the TTL (default 600s = 10 minutes) is served from that
 cache without touching the network — so the real endpoints are hit at most once
-every ten minutes no matter how often you run this. Failed fetches are never
-cached, so a transient error retries immediately on the next run. When a section
-is served from cache, it's annotated with the cache age. Override with the
-LLM_USAGE_CACHE_TTL env var (seconds; 0 disables), or bypass for a single run
-with --fresh / --no-cache. Cache lives under $XDG_CACHE_HOME/llm-usage
-(default ~/.cache/llm-usage).
+every ten minutes no matter how often you run this. A 429 (rate-limit) response
+is *negatively* cached for a longer window (default 1200s = 20 minutes): once a
+provider says we're rate-limited, no new call is made for that window, so
+re-running the tool won't keep poking a limited endpoint — it just reports the
+backoff and how long remains. Any other failure (401, 5xx, network) is never
+cached and retries on the next run. When a section is served from cache it's
+annotated with the cache age (or the 429 backoff remaining). Override the
+success window with LLM_USAGE_CACHE_TTL and the 429 window with
+LLM_USAGE_RATE_LIMIT_TTL (seconds; CACHE_TTL=0 disables caching entirely), or
+bypass for a single run with --fresh / --no-cache. Cache lives under
+$XDG_CACHE_HOME/llm-usage (default ~/.cache/llm-usage).
 
 No third-party dependencies — stdlib only. The provider SDKs do not expose
 these endpoints; both vendor CLIs hit them directly, and so do we.
@@ -219,21 +224,42 @@ def fetch_codex(tok: dict) -> tuple[int | None, Any]:
 
 # --------------------------------------------------------------- cache ----
 #
-# The undocumented usage endpoints are rate-limited and return transient 429s
-# under load, so we hit them at most once per TTL window (default 10 minutes)
-# per provider. Each *successful* (HTTP 200) response is written to a small
-# per-provider JSON file; any run within the TTL reuses it without a network
-# call. Failures are never cached, so an error retries on the very next run
-# rather than being pinned for ten minutes. Both the TUI and --json paths share
-# the cache via cached_fetch().
+# The undocumented usage endpoints are rate-limited and return 429s under load,
+# so we hit them at most once per TTL window per provider. Two TTLs apply:
+#
+#   * Success (HTTP 200): cached for cache_ttl() (default 10 minutes). Any run
+#     within the window reuses the response without a network call.
+#   * Rate-limit (HTTP 429): NEGATIVELY cached for rate_limit_ttl() (default
+#     20 minutes). Once we're told we're rate-limited, we make no new call for
+#     the whole negative window — repeatedly running the tool won't keep poking
+#     a limited endpoint and prolonging the block; it just reports the backoff.
+#
+# Any other failure (401, 5xx, network error) is NOT cached, so it retries on
+# the very next run. Both the TUI and --json paths share the cache via
+# cached_fetch(). --fresh/--no-cache (or LLM_USAGE_NO_CACHE) bypass reads;
+# LLM_USAGE_CACHE_TTL=0 disables caching entirely.
 
-DEFAULT_CACHE_TTL = 600  # seconds — "at most once every ten minutes"
-_CACHE_ENABLED = True     # flipped off by --fresh/--no-cache or env
+DEFAULT_CACHE_TTL = 600        # seconds — success: "once per ten minutes"
+DEFAULT_RATE_LIMIT_TTL = 1200  # seconds — 429 backoff: "no new call for 20 min"
+_CACHE_ENABLED = True          # flipped off by --fresh/--no-cache or env
+
+
+def _caching_off() -> bool:
+    """True when caching is disabled (by flag, env toggle, or TTL<=0)."""
+    if not _CACHE_ENABLED:
+        return True
+    raw = os.environ.get("LLM_USAGE_CACHE_TTL")
+    if raw is not None:
+        try:
+            return int(raw) <= 0
+        except ValueError:
+            return False
+    return False
 
 
 def cache_ttl() -> int:
-    """Effective cache TTL in seconds; 0 (or negative) disables caching."""
-    if not _CACHE_ENABLED:
+    """Success-cache TTL in seconds; 0 means caching is disabled."""
+    if _caching_off():
         return 0
     raw = os.environ.get("LLM_USAGE_CACHE_TTL")
     if raw is None:
@@ -242,6 +268,25 @@ def cache_ttl() -> int:
         return int(raw)
     except ValueError:
         return DEFAULT_CACHE_TTL
+
+
+def rate_limit_ttl() -> int:
+    """Negative-cache TTL for 429s in seconds; 0 means caching is disabled.
+
+    Independent of cache_ttl(): a custom LLM_USAGE_CACHE_TTL changes only the
+    success window, while the 429 backoff stays at its own default unless
+    LLM_USAGE_RATE_LIMIT_TTL is set.
+    """
+    if _caching_off():
+        return 0
+    raw = os.environ.get("LLM_USAGE_RATE_LIMIT_TTL")
+    if raw is None:
+        return DEFAULT_RATE_LIMIT_TTL
+    try:
+        v = int(raw)
+        return v if v > 0 else DEFAULT_RATE_LIMIT_TTL
+    except ValueError:
+        return DEFAULT_RATE_LIMIT_TTL
 
 
 def _cache_dir() -> str:
@@ -253,9 +298,14 @@ def _cache_path(provider: str) -> str:
     return os.path.join(_cache_dir(), f"{provider}.json")
 
 
-def cache_read(provider: str, ttl: int) -> tuple[int | None, Any, float] | None:
-    """Return (code, body, age_seconds) for a fresh cache entry, else None."""
-    if ttl <= 0:
+def cache_read(provider: str) -> tuple[int | None, Any, float] | None:
+    """Return (code, body, age_seconds) for a fresh cache entry, else None.
+
+    The TTL applied depends on the cached status: a 429 entry lives for
+    rate_limit_ttl() (negative cache / backoff), anything else (a 200) for
+    cache_ttl().
+    """
+    if _caching_off():
         return None
     try:
         with open(_cache_path(provider)) as f:
@@ -265,10 +315,14 @@ def cache_read(provider: str, ttl: int) -> tuple[int | None, Any, float] | None:
     ts = d.get("ts")
     if not isinstance(ts, (int, float)):
         return None
+    code = d.get("code")
+    ttl = rate_limit_ttl() if code == 429 else cache_ttl()
+    if ttl <= 0:
+        return None
     age = time.time() - ts
     if age < 0 or age > ttl:
         return None
-    return d.get("code"), d.get("body"), age
+    return code, d.get("body"), age
 
 
 def cache_write(provider: str, code: int | None, body: Any) -> None:
@@ -292,24 +346,28 @@ def cached_fetch(provider: str, fetch_fn, tok: dict
     """Fetch with a per-provider TTL cache.
 
     Returns (code, body, cache_age): cache_age is None for a live network
-    call, or the age in seconds of the served cache entry. Only HTTP 200
-    responses are cached; everything else falls through to a live call next
-    time so transient errors don't get pinned for the whole TTL.
+    call, or the age in seconds of the served cache entry. A 200 is cached for
+    the success TTL and a 429 for the (longer) rate-limit backoff TTL; any
+    other status falls through to a live call next time so transient errors
+    don't get pinned.
     """
-    ttl = cache_ttl()
-    hit = cache_read(provider, ttl)
+    hit = cache_read(provider)
     if hit is not None:
         code, body, age = hit
         return code, body, age
     code, body = fetch_fn(tok)
-    if code == 200:
+    if code in (200, 429):
         cache_write(provider, code, body)
     return code, body, None
 
 
-def cache_note(age: float | None) -> None:
-    """Print a dim 'served from cache' annotation when age is not None."""
-    if age is None:
+def cache_note(code: int | None, age: float | None) -> None:
+    """Print a dim 'served from cache' annotation for a cached success.
+
+    Cached 429s are surfaced by the sections' rate-limit branch instead, so
+    this stays quiet for them.
+    """
+    if age is None or code != 200:
         return
     print(f"  {DIM}↻ cached {fmt_relative(age)} ago "
           f"(refreshes after {fmt_relative(cache_ttl())}){RESET}")
@@ -440,6 +498,20 @@ def warn_line(msg: str) -> None:
     print(f"  {fg256(203)}✖ {msg}{RESET}")
 
 
+def rate_limit_warn(age: float | None) -> None:
+    """Report a 429 backoff. age=None means we hit it live this run; otherwise
+    it's the age of the negatively-cached 429 we're honoring."""
+    if age is None:
+        print(f"  {fg256(214)}● rate limited (429) — holding off new calls for "
+              f"{fmt_relative(rate_limit_ttl())} "
+              f"({DIM}--fresh to override{RESET}{fg256(214)}){RESET}")
+    else:
+        remaining = max(0.0, rate_limit_ttl() - age)
+        print(f"  {fg256(214)}● rate limited (429) {fmt_relative(age)} ago — "
+              f"holding off, retry in {fmt_relative(remaining)} "
+              f"({DIM}--fresh to override{RESET}{fg256(214)}){RESET}")
+
+
 def print_token_expiry(expires_at_ms: int | None) -> bool:
     """Print the OAuth-token-expiry line. Returns True if already expired."""
     if expires_at_ms is None:
@@ -480,11 +552,14 @@ def anthropic_section(width: int) -> bool:
     expired = print_token_expiry(tok.get("expires_at_ms"))
 
     code, a, age = cached_fetch("anthropic", fetch_anthropic, tok)
-    cache_note(age)
+    cache_note(code, age)
     if code == 401:
         warn_line("token rejected (401)"
                   + (" — expired" if expired else "")
                   + "; run `claude` to refresh")
+        return False
+    if code == 429:
+        rate_limit_warn(age)
         return False
     if code != 200:
         warn_line(f"API error {code}: {json.dumps(a)[:200]}")
@@ -533,12 +608,15 @@ def openai_section(width: int) -> bool:
     section_header("OPENAI",
                    f"ChatGPT {plan} plan" if plan else "ChatGPT", width)
     expired = print_token_expiry(tok.get("expires_at_ms"))
-    cache_note(age)
+    cache_note(code, age)
 
     if code == 401:
         warn_line("token rejected (401)"
                   + (" — expired" if expired else "")
                   + "; run `codex` to refresh")
+        return False
+    if code == 429:
+        rate_limit_warn(age)
         return False
     if code != 200:
         warn_line(f"API error {code}: {json.dumps(o)[:200]}")
@@ -596,7 +674,9 @@ def _anthropic_json() -> dict:
                 "cached": False, "cache_age_seconds": None}
     code, a, age = cached_fetch("anthropic", fetch_anthropic, tok)
     if code != 200:
-        return {"ok": False, "error": f"API error {code}", "windows": {},
+        err = "rate limited (429)" if code == 429 else f"API error {code}"
+        return {"ok": False, "error": err, "windows": {},
+                "rate_limited": code == 429,
                 "cached": age is not None, "cache_age_seconds": age}
     now = datetime.now(timezone.utc)
     windows: dict[str, Any] = {}
@@ -623,7 +703,9 @@ def _openai_json() -> dict:
                 "cached": False, "cache_age_seconds": None}
     code, o, age = cached_fetch("openai", fetch_codex, tok)
     if code != 200:
-        return {"ok": False, "error": f"API error {code}", "windows": {},
+        err = "rate limited (429)" if code == 429 else f"API error {code}"
+        return {"ok": False, "error": err, "windows": {},
+                "rate_limited": code == 429,
                 "cached": age is not None, "cache_age_seconds": age}
     rl = o.get("rate_limit") or {}
     windows: dict[str, Any] = {}
