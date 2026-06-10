@@ -18,7 +18,17 @@ echo $?              # 0 = both OK, 1 = one provider failed, 2 = both failed
 ```sh
 ./llm-usage --fresh   # bypass the cache for this run, hit the APIs live
 ./llm-usage --json     # machine-readable snapshot (also cached)
+./llm-usage --tui      # interactive curses view with resize + vertical scroll
 ```
+
+`--tui` requires an interactive terminal and exits 2 when stdout is not a TTY.
+`--tui --json` is invalid and exits 2. In TUI mode, `--fresh` bypasses cache
+reads only for the initial data load; subsequent refreshes are cache-aware.
+
+TUI controls: `↑`/`k`, `↓`/`j`, `PageUp`, `PageDown`, `Home`, `End`, mouse wheel
+when supported, and `q`/`Esc`/`Ctrl-C` to quit. The TUI refetches data when
+cache/backoff deadlines expire, repaints every 60 seconds for countdowns and
+cache ages, and redraws without fetching on resize or scroll.
 
 There is no lint/test command. Verify changes by running the script directly. Note: the Anthropic endpoint occasionally returns a transient 429; that renders as an inline section error and exit code 1, not a bug.
 
@@ -52,7 +62,12 @@ Top-to-bottom pipeline, one section per provider, each failing independently:
 
 1. **Token loaders** (`load_anthropic_token`, `load_codex_token`) — chain of sources: env var → macOS Keychain (`security find-generic-password`, Anthropic only) → credential file (`~/.claude/.credentials.json` / `~/.codex/auth.json`). Codex token expiry comes from locally decoding the access token's JWT `exp` claim (`jwt_claims` — unverified by design, inspection only).
 2. **Fetchers** (`fetch_anthropic`, `fetch_codex`) — GET the undocumented usage endpoints (`api.anthropic.com/api/oauth/usage`, `chatgpt.com/backend-api/wham/usage`) via `http_get_json`, which never raises: it returns `(status_or_None, body)`.
-3. **Sections** (`anthropic_section`, `openai_section`) — each returns a success bool and degrades any failure (no token, 401, API error) to an inline `warn_line` so the other section still renders. The two providers' response shapes differ: Anthropic returns named bands (`five_hour`, `seven_day`, `seven_day_opus`, …) with `utilization` + `resets_at` ISO timestamps; OpenAI returns `rate_limit.{primary,secondary}_window` with `used_percent` + window/reset seconds.
+3. **Snapshots + sections** (`anthropic_snapshot` / `openai_snapshot`, then `render_anthropic_section` / `render_openai_section`) — each provider fetch/load happens once per data refresh, then renders independently and degrades any failure (no token, 401, API error) to an inline `warn_line` so the other section still renders. The two providers' response shapes differ: Anthropic returns named bands (`five_hour`, `seven_day`, `seven_day_opus`, …) with `utilization` + `resets_at` ISO timestamps; OpenAI returns `rate_limit.{primary,secondary}_window` with `used_percent` + window/reset seconds.
 4. **Row renderer** (`row`) — the core visual idea: each band is a 3-line block where line 0 places a `▼` at the percent-of-window-elapsed position above a usage bar (line 1), so bar-end vs. `▼` position *is* the over/under-pace signal. Pace verdict (±5pp threshold) colors both the `▼` and the trailing annotation.
+
+The render path now uses provider snapshots: data fetch/load happens once, then
+`render_dashboard_snapshot` can repaint the same snapshot at a new width or a
+later time without another provider/cache read. Preserve that boundary for TUI
+resize, scroll, and 60-second repaint behavior.
 
 The trailing `__main__` block deliberately handles `BrokenPipeError` (exit 141) including the interpreter's exit-time stdout flush — preserve that if touching `main()`.

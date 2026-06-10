@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import base64
 import json
+import locale
 import os
 import re
 import shutil
@@ -96,6 +97,58 @@ def color_for_pct(p: float) -> str:
 
 def visible_len(s: str) -> int:
     return len(re.sub(r"\033\[[0-9;]*m", "", s))
+
+
+ANSI_RE = re.compile(r"\033\[([0-9;]*)m")
+
+
+def clip_ansi(s: str, width: int) -> str:
+    """Clip a string to a display width without counting SGR escapes."""
+    if width <= 0:
+        return ""
+    if visible_len(s) <= width:
+        return s
+
+    out = []
+    col = 0
+    pos = 0
+    clipped = False
+    for m in ANSI_RE.finditer(s):
+        text = s[pos:m.start()]
+        for ch in text:
+            if col >= width:
+                clipped = True
+                break
+            out.append(ch)
+            col += 1
+        if col < width:
+            out.append(m.group(0))
+        else:
+            clipped = True
+            break
+        pos = m.end()
+
+    if not clipped:
+        for ch in s[pos:]:
+            if col >= width:
+                clipped = True
+                break
+            out.append(ch)
+            col += 1
+
+    if "\033[" in s:
+        out.append(RESET)
+    return "".join(out)
+
+
+def fit_text(s: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if len(s) <= width:
+        return s
+    if width == 1:
+        return s[:1]
+    return s[:width - 1] + "…"
 
 
 # ----------------------------------------------------- token loaders ----
@@ -241,13 +294,13 @@ def fetch_codex(tok: dict) -> tuple[int | None, Any]:
 
 DEFAULT_CACHE_TTL = 600        # seconds — success: "once per ten minutes"
 DEFAULT_RATE_LIMIT_TTL = 1200  # seconds — 429 backoff: "no new call for 20 min"
-_CACHE_ENABLED = True          # flipped off by --fresh/--no-cache or env
+DEFAULT_TUI_RETRY_SECONDS = 60
+TUI_REPAINT_SECONDS = 60
+_CACHE_READ_BYPASS = False     # set by --fresh/--no-cache or env
 
 
 def _caching_off() -> bool:
-    """True when caching is disabled (by flag, env toggle, or TTL<=0)."""
-    if not _CACHE_ENABLED:
-        return True
+    """True when cache reads and writes are disabled by TTL configuration."""
     raw = os.environ.get("LLM_USAGE_CACHE_TTL")
     if raw is not None:
         try:
@@ -305,7 +358,7 @@ def cache_read(provider: str) -> tuple[int | None, Any, float] | None:
     rate_limit_ttl() (negative cache / backoff), anything else (a 200) for
     cache_ttl().
     """
-    if _caching_off():
+    if _CACHE_READ_BYPASS or _caching_off():
         return None
     try:
         with open(_cache_path(provider)) as f:
@@ -356,21 +409,21 @@ def cached_fetch(provider: str, fetch_fn, tok: dict
         code, body, age = hit
         return code, body, age
     code, body = fetch_fn(tok)
-    if code in (200, 429):
+    if code in (200, 429) and not _caching_off():
         cache_write(provider, code, body)
     return code, body, None
 
 
-def cache_note(code: int | None, age: float | None) -> None:
-    """Print a dim 'served from cache' annotation for a cached success.
+def cache_note_line(code: int | None, age: float | None) -> str | None:
+    """Return a dim 'served from cache' annotation for a cached success.
 
     Cached 429s are surfaced by the sections' rate-limit branch instead, so
     this stays quiet for them.
     """
     if age is None or code != 200:
-        return
-    print(f"  {DIM}↻ cached {fmt_relative(age)} ago "
-          f"(refreshes after {fmt_relative(cache_ttl())}){RESET}")
+        return None
+    return (f"  {DIM}↻ cached {fmt_relative(age)} ago "
+            f"(refreshes after {fmt_relative(cache_ttl())}){RESET}")
 
 
 # ----------------------------------------------------------- bar render ----
@@ -440,13 +493,24 @@ def fmt_window(seconds: int) -> str:
 
 # ------------------------------------------------------------------ row ----
 
+def label_width(width: int) -> int:
+    if width < 46:
+        return 10
+    if width < 72:
+        return 14
+    return 18
+
+
 def row(label: str, usage_pct: float, now_pct: float | None,
         reset_dt: datetime | None, reset_seconds: float | None,
-        width: int, label_w: int = 18) -> str:
+        width: int, label_w: int | None = None) -> str:
+    label_w = label_width(width) if label_w is None else label_w
     pct_str = f"{usage_pct:4.0f}%"
-    bar_w = max(8, width - label_w - len(pct_str) - 2)
+    min_bar = 4 if width < 46 else 8
+    bar_w = max(min_bar, width - label_w - len(pct_str) - 2)
     bar, overflow = render_bar(bar_w, usage_pct)
-    lbl = f"{BOLD}{label:<{label_w}}{RESET}"
+    raw_label = fit_text(label, label_w)
+    lbl = f"{BOLD}{raw_label:<{label_w}}{RESET}"
     pct_color = color_for_pct(usage_pct)
     overflow_mark = f" {fg256(203)}↑{RESET}" if overflow else "  "
     line1 = f"{lbl}{bar}{overflow_mark}{pct_color}{pct_str}{RESET}"
@@ -457,123 +521,188 @@ def row(label: str, usage_pct: float, now_pct: float | None,
         margin = usage_pct - now_pct
         if usage_pct >= now_pct + 5:
             pace_color = fg256(203)
-            pace = f"   {pace_color}↑ {margin:+.0f}pp over pace{RESET}"
+            verdict = "over pace"
         elif usage_pct <= now_pct - 5:
             pace_color = fg256(78)
-            pace = f"   {pace_color}↓ {margin:+.0f}pp under pace{RESET}"
+            verdict = "under pace"
         else:
             pace_color = WHITE
+            verdict = "on pace"
+        if verdict == "on pace":
             pace = f"   {pace_color}≈ on pace{RESET}"
+        elif width < 64:
+            arrow = "↑" if verdict == "over pace" else "↓"
+            pace = f"   {pace_color}{arrow} {margin:+.0f}pp{RESET}"
+        else:
+            arrow = "↑" if verdict == "over pace" else "↓"
+            pace = f"   {pace_color}{arrow} {margin:+.0f}pp {verdict}{RESET}"
         now_idx = min(max(0, round(now_pct / 100 * bar_w)), bar_w - 1)
         line0 = " " * (label_w + now_idx) + pace_color + NOW_MARK + RESET
 
     parts = []
-    if reset_dt:
+    if reset_dt and width >= 84:
         parts.append(f"resets {fmt_local(reset_dt)}")
     if reset_seconds is not None:
         parts.append(f"in {fmt_relative(reset_seconds)}")
-    if now_pct is not None:
+    if now_pct is not None and width >= 58:
         parts.append(f"window {now_pct:.0f}% elapsed")
+    if width < 44:
+        pace = ""
     if not parts and not pace:
-        return line0 + "\n" + line1
+        return clip_ansi(line0, width) + "\n" + clip_ansi(line1, width)
     sub = SUB_FG + "  ·  ".join(parts) + RESET + pace
     line2 = f"{' ' * label_w}{sub}"
-    return line0 + "\n" + line1 + "\n" + line2
+    return "\n".join([
+        clip_ansi(line0, width),
+        clip_ansi(line1, width),
+        clip_ansi(line2, width),
+    ])
 
 
 # -------------------------------------------------------------- header ----
 
-def section_header(title: str, plan: str, width: int) -> None:
+def section_header(title: str, plan: str, width: int) -> list[str]:
     left = f"{BOLD}{title}{RESET}"
-    if plan:
+    if plan and width >= 48:
         left += f"  {DIM}{plan}{RESET}"
     now_str = datetime.now().astimezone().strftime("%a %b %d %H:%M %Z")
-    pad = width - visible_len(left) - len(now_str)
-    pad = max(1, pad)
-    print(left + " " * pad + DIM + now_str + RESET)
-    print(RULE_FG + "─" * width + RESET)
-
-
-def warn_line(msg: str) -> None:
-    print(f"  {fg256(203)}✖ {msg}{RESET}")
-
-
-def rate_limit_warn(age: float | None) -> None:
-    """Report a 429 backoff. age=None means we hit it live this run; otherwise
-    it's the age of the negatively-cached 429 we're honoring."""
-    if age is None:
-        print(f"  {fg256(214)}● rate limited (429) — holding off new calls for "
-              f"{fmt_relative(rate_limit_ttl())} "
-              f"({DIM}--fresh to override{RESET}{fg256(214)}){RESET}")
+    if width < 48:
+        line = left
     else:
-        remaining = max(0.0, rate_limit_ttl() - age)
-        print(f"  {fg256(214)}● rate limited (429) {fmt_relative(age)} ago — "
-              f"holding off, retry in {fmt_relative(remaining)} "
-              f"({DIM}--fresh to override{RESET}{fg256(214)}){RESET}")
+        pad = width - visible_len(left) - len(now_str)
+        if pad < 1:
+            line = left
+        else:
+            line = left + " " * pad + DIM + now_str + RESET
+    return [clip_ansi(line, width), RULE_FG + "─" * width + RESET]
 
 
-def print_token_expiry(expires_at_ms: int | None) -> bool:
-    """Print the OAuth-token-expiry line. Returns True if already expired."""
+def warn_line(msg: str) -> str:
+    return f"  {fg256(203)}✖ {msg}{RESET}"
+
+
+def rate_limit_warn_line(age: float | None) -> str:
+    """Report a 429 backoff. age=None means we hit it live this render."""
+    if age is None:
+        return (f"  {fg256(214)}● rate limited (429) — holding off new calls for "
+                f"{fmt_relative(rate_limit_ttl())} "
+                f"({DIM}--fresh to override{RESET}{fg256(214)}){RESET}")
+    remaining = max(0.0, rate_limit_ttl() - age)
+    return (f"  {fg256(214)}● rate limited (429) {fmt_relative(age)} ago — "
+            f"holding off, retry in {fmt_relative(remaining)} "
+            f"({DIM}--fresh to override{RESET}{fg256(214)}){RESET}")
+
+
+def token_expiry_line(expires_at_ms: int | None) -> tuple[str, bool]:
+    """Return the OAuth-token-expiry line and whether it is already expired."""
     if expires_at_ms is None:
-        print(f"  {DIM}token expiry unknown{RESET}")
-        return False
+        return f"  {DIM}token expiry unknown{RESET}", False
     exp = datetime.fromtimestamp(expires_at_ms / 1000, tz=timezone.utc)
     secs = (exp - datetime.now(timezone.utc)).total_seconds()
     if secs <= 0:
-        print(f"  {fg256(203)}✖ OAuth token expired {fmt_relative(-secs)} "
-              f"ago ({fmt_local(exp)}){RESET}")
-        return True
+        return (f"  {fg256(203)}✖ OAuth token expired {fmt_relative(-secs)} "
+                f"ago ({fmt_local(exp)}){RESET}", True)
     if secs < 3600:
         prefix = f"{fg256(203)}⚠ "
     elif secs < 7 * 86400:
         prefix = f"{fg256(214)}⚠ "
     else:
         prefix = SUB_FG
-    print(f"  {prefix}OAuth token expires in {fmt_relative(secs)} "
-          f"({fmt_local(exp)}){RESET}")
-    return False
+    return (f"  {prefix}OAuth token expires in {fmt_relative(secs)} "
+            f"({fmt_local(exp)}){RESET}", False)
 
 
 # ------------------------------------------------------------- sections ----
 
-def anthropic_section(width: int) -> bool:
-    """Render the Anthropic section. Returns True on full success."""
+def next_data_refresh_deadline(code: int | None, age: float | None,
+                               loaded_at: float) -> float:
+    if code == 200:
+        ttl = cache_ttl()
+    elif code == 429:
+        ttl = rate_limit_ttl()
+    else:
+        return loaded_at + DEFAULT_TUI_RETRY_SECONDS
+    if ttl <= 0:
+        return loaded_at + DEFAULT_TUI_RETRY_SECONDS
+    return loaded_at + max(1.0, ttl - (age or 0.0))
+
+
+def snapshot_elapsed(snapshot: dict) -> float:
+    return max(0.0, time.time() - float(snapshot.get("loaded_at", time.time())))
+
+
+def displayed_cache_age(snapshot: dict, include_live_429: bool = False
+                        ) -> float | None:
+    age = snapshot.get("age")
+    if age is not None:
+        return float(age) + snapshot_elapsed(snapshot)
+    if include_live_429 and snapshot.get("code") == 429:
+        return snapshot_elapsed(snapshot)
+    return None
+
+
+def anthropic_snapshot() -> dict:
+    loaded_at = time.time()
     tok = load_anthropic_token()
     if not tok or not tok.get("access_token"):
-        section_header("ANTHROPIC", "Claude", width)
-        warn_line("no OAuth token "
-                  "(set $CLAUDE_CODE_OAUTH_TOKEN or run `claude` to login)")
-        return False
+        return {"provider": "anthropic", "token": None, "code": None,
+                "body": None, "age": None, "loaded_at": loaded_at,
+                "deadline": loaded_at + DEFAULT_TUI_RETRY_SECONDS}
+
+    code, body, age = cached_fetch("anthropic", fetch_anthropic, tok)
+    return {"provider": "anthropic", "token": tok, "code": code,
+            "body": body, "age": age, "loaded_at": loaded_at,
+            "deadline": next_data_refresh_deadline(code, age, loaded_at)}
+
+
+def render_anthropic_section(snapshot: dict, width: int) -> tuple[list[str], bool]:
+    """Render the Anthropic section. Returns lines plus success state."""
+    lines = []
+    tok = snapshot.get("token")
+    if not tok or not tok.get("access_token"):
+        lines.extend(section_header("ANTHROPIC", "Claude", width))
+        lines.append(warn_line("no OAuth token "
+                               "(set $CLAUDE_CODE_OAUTH_TOKEN or run `claude` "
+                               "to login)"))
+        return [clip_ansi(line, width) for line in lines], False
 
     plan_label = (tok.get("subscription") or "").upper()
-    section_header("ANTHROPIC",
-                   f"Claude {plan_label} plan" if plan_label else "Claude",
-                   width)
-    expired = print_token_expiry(tok.get("expires_at_ms"))
+    lines.extend(section_header(
+        "ANTHROPIC",
+        f"Claude {plan_label} plan" if plan_label else "Claude",
+        width,
+    ))
+    expiry, expired = token_expiry_line(tok.get("expires_at_ms"))
+    lines.append(expiry)
 
-    code, a, age = cached_fetch("anthropic", fetch_anthropic, tok)
-    cache_note(code, age)
+    code = snapshot.get("code")
+    body = snapshot.get("body") or {}
+    age = displayed_cache_age(snapshot)
+    note = cache_note_line(code, age)
+    if note:
+        lines.append(note)
     if code == 401:
-        warn_line("token rejected (401)"
-                  + (" — expired" if expired else "")
-                  + "; run `claude` to refresh")
-        return False
+        lines.append(warn_line("token rejected (401)"
+                               + (" — expired" if expired else "")
+                               + "; run `claude` to refresh"))
+        return [clip_ansi(line, width) for line in lines], False
     if code == 429:
-        rate_limit_warn(age)
-        return False
+        lines.append(rate_limit_warn_line(
+            displayed_cache_age(snapshot, include_live_429=True)))
+        return [clip_ansi(line, width) for line in lines], False
     if code != 200:
-        warn_line(f"API error {code}: {json.dumps(a)[:200]}")
-        return False
+        lines.append(warn_line(f"API error {code}: {json.dumps(body)[:200]}"))
+        return [clip_ansi(line, width) for line in lines], False
 
-    print()
+    lines.append("")
     now = datetime.now(timezone.utc)
     bands = [
-        ("7-day overall", a.get("seven_day"), 7 * 86400),
-        ("5-hour", a.get("five_hour"), 5 * 3600),
-        ("7-day Sonnet", a.get("seven_day_sonnet"), 7 * 86400),
-        ("7-day Opus", a.get("seven_day_opus"), 7 * 86400),
-        ("7-day OAuth apps", a.get("seven_day_oauth_apps"), 7 * 86400),
-        ("7-day cowork", a.get("seven_day_cowork"), 7 * 86400),
+        ("7-day overall", body.get("seven_day"), 7 * 86400),
+        ("5-hour", body.get("five_hour"), 5 * 3600),
+        ("7-day Sonnet", body.get("seven_day_sonnet"), 7 * 86400),
+        ("7-day Opus", body.get("seven_day_opus"), 7 * 86400),
+        ("7-day OAuth apps", body.get("seven_day_oauth_apps"), 7 * 86400),
+        ("7-day cowork", body.get("seven_day_cowork"), 7 * 86400),
     ]
     printed = 0
     for label, data, window_s in bands:
@@ -587,48 +716,85 @@ def anthropic_section(width: int) -> bool:
         else:
             rem = None
             now_pct = None
-        print(row(label, usage, now_pct, reset_dt, rem, width))
+        lines.extend(row(label, usage, now_pct, reset_dt, rem, width).splitlines())
         printed += 1
     if not printed:
-        print(f"  {DIM}(no usage data){RESET}")
-    return True
+        lines.append(f"  {DIM}(no usage data){RESET}")
+    return [clip_ansi(line, width) for line in lines], True
 
 
-def openai_section(width: int) -> bool:
-    """Render the OpenAI section. Returns True on full success."""
+def openai_snapshot() -> dict:
+    loaded_at = time.time()
     tok = load_codex_token()
     if not tok or not tok.get("access_token"):
-        section_header("OPENAI", "ChatGPT", width)
-        warn_line("no OAuth token "
-                  "(set $CODEX_OAUTH_TOKEN or run `codex` to login)")
-        return False
+        return {"provider": "openai", "token": None, "code": None,
+                "body": None, "age": None, "loaded_at": loaded_at,
+                "deadline": loaded_at + DEFAULT_TUI_RETRY_SECONDS}
 
-    code, o, age = cached_fetch("openai", fetch_codex, tok)
-    plan = (o.get("plan_type") or "").title() if code == 200 else ""
-    section_header("OPENAI",
-                   f"ChatGPT {plan} plan" if plan else "ChatGPT", width)
-    expired = print_token_expiry(tok.get("expires_at_ms"))
-    cache_note(code, age)
+    code, body, age = cached_fetch("openai", fetch_codex, tok)
+    return {"provider": "openai", "token": tok, "code": code,
+            "body": body, "age": age, "loaded_at": loaded_at,
+            "deadline": next_data_refresh_deadline(code, age, loaded_at)}
+
+
+def adjusted_openai_reset_seconds(snapshot: dict, window: dict
+                                  ) -> float | None:
+    reset_at = window.get("reset_at")
+    if reset_at:
+        reset_dt = datetime.fromtimestamp(reset_at, tz=timezone.utc)
+        return max(0.0, (reset_dt - datetime.now(timezone.utc)).total_seconds())
+    rem_s = window.get("reset_after_seconds")
+    if rem_s is None:
+        return None
+    return max(0.0, float(rem_s) - snapshot_elapsed(snapshot))
+
+
+def render_openai_section(snapshot: dict, width: int) -> tuple[list[str], bool]:
+    """Render the OpenAI section. Returns lines plus success state."""
+    lines = []
+    tok = snapshot.get("token")
+    if not tok or not tok.get("access_token"):
+        lines.extend(section_header("OPENAI", "ChatGPT", width))
+        lines.append(warn_line("no OAuth token "
+                               "(set $CODEX_OAUTH_TOKEN or run `codex` "
+                               "to login)"))
+        return [clip_ansi(line, width) for line in lines], False
+
+    code = snapshot.get("code")
+    body = snapshot.get("body") or {}
+    plan = (body.get("plan_type") or "").title() if code == 200 else ""
+    lines.extend(section_header(
+        "OPENAI",
+        f"ChatGPT {plan} plan" if plan else "ChatGPT",
+        width,
+    ))
+    expiry, expired = token_expiry_line(tok.get("expires_at_ms"))
+    lines.append(expiry)
+    age = displayed_cache_age(snapshot)
+    note = cache_note_line(code, age)
+    if note:
+        lines.append(note)
 
     if code == 401:
-        warn_line("token rejected (401)"
-                  + (" — expired" if expired else "")
-                  + "; run `codex` to refresh")
-        return False
+        lines.append(warn_line("token rejected (401)"
+                               + (" — expired" if expired else "")
+                               + "; run `codex` to refresh"))
+        return [clip_ansi(line, width) for line in lines], False
     if code == 429:
-        rate_limit_warn(age)
-        return False
+        lines.append(rate_limit_warn_line(
+            displayed_cache_age(snapshot, include_live_429=True)))
+        return [clip_ansi(line, width) for line in lines], False
     if code != 200:
-        warn_line(f"API error {code}: {json.dumps(o)[:200]}")
-        return False
+        lines.append(warn_line(f"API error {code}: {json.dumps(body)[:200]}"))
+        return [clip_ansi(line, width) for line in lines], False
 
-    print()
-    rl = o.get("rate_limit") or {}
+    lines.append("")
+    rl = body.get("rate_limit") or {}
     if rl.get("limit_reached"):
-        print(f"  {fg256(203)}● limit reached — requests will be rejected"
-              f"{RESET}")
+        lines.append(f"  {fg256(203)}● limit reached — requests will be rejected"
+                     f"{RESET}")
     elif not rl.get("allowed", True):
-        print(f"  {fg256(214)}⚠ requests not currently allowed{RESET}")
+        lines.append(f"  {fg256(214)}⚠ requests not currently allowed{RESET}")
 
     printed = 0
     # Weekly (secondary) window first — it's the limit that matters most.
@@ -641,7 +807,7 @@ def openai_section(width: int) -> bool:
             continue
         usage = float(w.get("used_percent", 0))
         wnd_s = w.get("limit_window_seconds")
-        rem_s = w.get("reset_after_seconds")
+        rem_s = adjusted_openai_reset_seconds(snapshot, w)
         if wnd_s and rem_s is not None:
             now_pct = max(0.0, min(100.0,
                                    (wnd_s - rem_s) / wnd_s * 100))
@@ -653,11 +819,11 @@ def openai_section(width: int) -> bool:
         label = fmt_window(wnd_s) if wnd_s else default_label
         if key == "secondary_window":
             label = f"{label} (weekly)"
-        print(row(label, usage, now_pct, reset_dt, rem_s, width))
+        lines.extend(row(label, usage, now_pct, reset_dt, rem_s, width).splitlines())
         printed += 1
     if not printed:
-        print(f"  {DIM}(no usage data){RESET}")
-    return True
+        lines.append(f"  {DIM}(no usage data){RESET}")
+    return [clip_ansi(line, width) for line in lines], True
 
 
 # ------------------------------------------------------------ json output ----
@@ -732,26 +898,28 @@ def emit_json() -> int:
     return 0 if (a["ok"] and o["ok"]) else (1 if (a["ok"] or o["ok"]) else 2)
 
 
-# ----------------------------------------------------------------- main ----
+# ------------------------------------------------------------ dashboard ----
 
-def parse_cache_flags() -> None:
-    """Honor --fresh/--no-cache and LLM_USAGE_NO_CACHE before any fetch."""
-    global _CACHE_ENABLED
-    args = sys.argv[1:]
-    if "--fresh" in args or "--no-cache" in args:
-        _CACHE_ENABLED = False
-    if os.environ.get("LLM_USAGE_NO_CACHE"):
-        _CACHE_ENABLED = False
+def load_dashboard_snapshot() -> dict:
+    a = anthropic_snapshot()
+    o = openai_snapshot()
+    deadline = min(float(a["deadline"]), float(o["deadline"]))
+    return {"anthropic": a, "openai": o, "deadline": deadline}
 
 
-def main() -> None:
-    parse_cache_flags()
-    if "--json" in sys.argv[1:]:
-        sys.exit(emit_json())
+def display_width(columns: int, clamp: bool) -> int:
+    if clamp:
+        return min(max(columns, 60), 140)
+    return max(20, columns)
 
-    width = shutil.get_terminal_size((100, 24)).columns
-    width = min(max(width, 60), 140)
 
+def dashboard_exit_code(a_ok: bool, o_ok: bool) -> int:
+    if a_ok and o_ok:
+        return 0
+    return 1 if (a_ok or o_ok) else 2
+
+
+def legend_lines() -> list[str]:
     legend_used = (
         f"{DIM}Used:{RESET} "
         f"{fg256(78)}{FULL}{RESET} ok  "
@@ -765,19 +933,288 @@ def main() -> None:
         f"{WHITE}{NOW_MARK}{RESET} on  "
         f"{fg256(203)}{NOW_MARK}{RESET} over"
     )
-    print()
-    print(legend_used)
-    print(legend_pace)
-    print()
-    a_ok = anthropic_section(width)
-    print()
-    print(RULE_FG + "═" * width + RESET)
-    print()
-    o_ok = openai_section(width)
-    print()
+    return ["", legend_used, legend_pace, ""]
 
-    if not (a_ok and o_ok):
-        sys.exit(1 if (a_ok or o_ok) else 2)
+
+def render_dashboard_snapshot(snapshot: dict, columns: int,
+                              clamp_width: bool) -> tuple[list[str], int]:
+    width = display_width(columns, clamp_width)
+    lines = legend_lines()
+    a_lines, a_ok = render_anthropic_section(snapshot["anthropic"], width)
+    lines.extend(a_lines)
+    lines.extend(["", RULE_FG + "═" * width + RESET, ""])
+    o_lines, o_ok = render_openai_section(snapshot["openai"], width)
+    lines.extend(o_lines)
+    lines.append("")
+    return [clip_ansi(line, width) for line in lines], dashboard_exit_code(a_ok, o_ok)
+
+
+def render_dashboard(columns: int, clamp_width: bool
+                     ) -> tuple[dict, list[str], int]:
+    snapshot = load_dashboard_snapshot()
+    lines, exit_code = render_dashboard_snapshot(snapshot, columns, clamp_width)
+    return snapshot, lines, exit_code
+
+
+# ----------------------------------------------------------------- main ----
+
+def no_cache_env() -> bool:
+    return bool(os.environ.get("LLM_USAGE_NO_CACHE"))
+
+
+def set_cache_read_bypass(value: bool) -> None:
+    global _CACHE_READ_BYPASS
+    _CACHE_READ_BYPASS = value
+
+
+def parse_cache_flags(args: list[str]) -> bool:
+    """Honor --fresh/--no-cache and LLM_USAGE_NO_CACHE before any fetch."""
+    fresh = "--fresh" in args or "--no-cache" in args
+    set_cache_read_bypass(fresh or no_cache_env())
+    return fresh
+
+
+def curses_color(curses_mod, color: int, pairs: dict[int, int]) -> int:
+    if not curses_mod.has_colors():
+        return 0
+    if color == 97:
+        color = 15 if curses_mod.COLORS > 15 else curses_mod.COLOR_WHITE
+    elif color >= curses_mod.COLORS:
+        color = {
+            78: curses_mod.COLOR_GREEN,
+            186: curses_mod.COLOR_YELLOW,
+            214: curses_mod.COLOR_YELLOW,
+            203: curses_mod.COLOR_RED,
+            238: curses_mod.COLOR_WHITE,
+            240: curses_mod.COLOR_WHITE,
+            245: curses_mod.COLOR_WHITE,
+        }.get(color, curses_mod.COLOR_WHITE)
+    if color not in pairs:
+        pair_id = len(pairs) + 1
+        if pair_id >= curses_mod.COLOR_PAIRS:
+            return 0
+        try:
+            curses_mod.init_pair(pair_id, color, -1)
+        except curses_mod.error:
+            return 0
+        pairs[color] = pair_id
+    return curses_mod.color_pair(pairs[color])
+
+
+def apply_sgr(curses_mod, codes: list[int], style: int, color_attr: int,
+              pairs: dict[int, int]) -> tuple[int, int]:
+    i = 0
+    if not codes:
+        codes = [0]
+    while i < len(codes):
+        code = codes[i]
+        if code == 0:
+            style = 0
+            color_attr = 0
+        elif code == 1:
+            style |= curses_mod.A_BOLD
+        elif code == 2:
+            style |= curses_mod.A_DIM
+        elif code == 22:
+            style &= ~(curses_mod.A_BOLD | curses_mod.A_DIM)
+        elif code == 39:
+            color_attr = 0
+        elif code == 97:
+            color_attr = curses_color(curses_mod, 97, pairs)
+        elif code == 38 and i + 2 < len(codes) and codes[i + 1] == 5:
+            color_attr = curses_color(curses_mod, codes[i + 2], pairs)
+            i += 2
+        i += 1
+    return style, color_attr
+
+
+def draw_text(stdscr, y: int, x: int, text: str, width: int, attr: int) -> int:
+    if width <= 0 or not text:
+        return 0
+    part = text[:width]
+    try:
+        stdscr.addstr(y, x, part, attr)
+    except Exception:
+        pass
+    return len(part)
+
+
+def draw_ansi_line(curses_mod, stdscr, y: int, line: str, width: int,
+                   pairs: dict[int, int]) -> None:
+    style = 0
+    color_attr = 0
+    col = 0
+    pos = 0
+    for m in ANSI_RE.finditer(line):
+        text = line[pos:m.start()]
+        col += draw_text(stdscr, y, col, text, width - col,
+                         style | color_attr)
+        if col >= width:
+            return
+        raw_codes = [c for c in m.group(1).split(";") if c]
+        try:
+            codes = [int(c) for c in raw_codes]
+        except ValueError:
+            codes = [0]
+        style, color_attr = apply_sgr(curses_mod, codes, style, color_attr,
+                                      pairs)
+        pos = m.end()
+    if col < width:
+        draw_text(stdscr, y, col, line[pos:], width - col, style | color_attr)
+
+
+def clamp_scroll(scroll: int, line_count: int, height: int) -> int:
+    return min(max(0, scroll), max(0, line_count - max(1, height)))
+
+
+def draw_tui(curses_mod, stdscr, lines: list[str], scroll: int,
+             pairs: dict[int, int]) -> None:
+    height, width = stdscr.getmaxyx()
+    stdscr.erase()
+    for y in range(height):
+        idx = scroll + y
+        if idx >= len(lines):
+            break
+        draw_ansi_line(curses_mod, stdscr, y, lines[idx], width, pairs)
+    stdscr.noutrefresh()
+    curses_mod.doupdate()
+
+
+def setup_curses(curses_mod, stdscr) -> dict[int, int]:
+    stdscr.keypad(True)
+    try:
+        curses_mod.curs_set(0)
+    except curses_mod.error:
+        pass
+    if curses_mod.has_colors():
+        curses_mod.start_color()
+        try:
+            curses_mod.use_default_colors()
+        except curses_mod.error:
+            pass
+    try:
+        curses_mod.mousemask(curses_mod.ALL_MOUSE_EVENTS)
+    except curses_mod.error:
+        pass
+    return {}
+
+
+def run_tui(initial_fresh: bool) -> int:
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error:
+        pass
+    try:
+        import curses
+    except ImportError:
+        print("llm-usage: --tui requires the stdlib curses module",
+              file=sys.stderr)
+        return 2
+
+    def _run(stdscr) -> int:
+        pairs = setup_curses(curses, stdscr)
+        height, width = stdscr.getmaxyx()
+        snapshot, lines, exit_code = render_dashboard(width, clamp_width=False)
+        if initial_fresh:
+            set_cache_read_bypass(no_cache_env())
+        scroll = 0
+        next_data = float(snapshot["deadline"])
+        next_repaint = time.time() + TUI_REPAINT_SECONDS
+        draw_tui(curses, stdscr, lines, scroll, pairs)
+
+        while True:
+            now = time.time()
+            if now >= next_data:
+                height, width = stdscr.getmaxyx()
+                snapshot, lines, exit_code = render_dashboard(
+                    width, clamp_width=False)
+                next_data = float(snapshot["deadline"])
+                next_repaint = now + TUI_REPAINT_SECONDS
+                scroll = clamp_scroll(scroll, len(lines), height)
+                draw_tui(curses, stdscr, lines, scroll, pairs)
+                continue
+            if now >= next_repaint:
+                height, width = stdscr.getmaxyx()
+                lines, exit_code = render_dashboard_snapshot(
+                    snapshot, width, clamp_width=False)
+                next_repaint = now + TUI_REPAINT_SECONDS
+                scroll = clamp_scroll(scroll, len(lines), height)
+                draw_tui(curses, stdscr, lines, scroll, pairs)
+                continue
+
+            wait = min(next_data, next_repaint) - now
+            stdscr.timeout(min(1000, max(50, int(wait * 1000))))
+            ch = stdscr.getch()
+            if ch == -1:
+                continue
+            if ch in (ord("q"), ord("Q"), 27):
+                return exit_code
+            if ch == 3:
+                return 130
+
+            height, width = stdscr.getmaxyx()
+            old_scroll = scroll
+            redraw = False
+            if ch == curses.KEY_RESIZE:
+                lines, exit_code = render_dashboard_snapshot(
+                    snapshot, width, clamp_width=False)
+                redraw = True
+            elif ch in (curses.KEY_UP, ord("k"), ord("K")):
+                scroll -= 1
+            elif ch in (curses.KEY_DOWN, ord("j"), ord("J")):
+                scroll += 1
+            elif ch == curses.KEY_PPAGE:
+                scroll -= max(1, height - 1)
+            elif ch == curses.KEY_NPAGE:
+                scroll += max(1, height - 1)
+            elif ch == curses.KEY_HOME:
+                scroll = 0
+            elif ch == curses.KEY_END:
+                scroll = len(lines)
+            elif ch == curses.KEY_MOUSE:
+                try:
+                    _id, _x, _y, _z, bstate = curses.getmouse()
+                except curses.error:
+                    bstate = 0
+                if bstate & getattr(curses, "BUTTON4_PRESSED", 0):
+                    scroll -= 3
+                elif bstate & getattr(curses, "BUTTON5_PRESSED", 0):
+                    scroll += 3
+
+            scroll = clamp_scroll(scroll, len(lines), height)
+            if redraw or scroll != old_scroll:
+                draw_tui(curses, stdscr, lines, scroll, pairs)
+
+    try:
+        return curses.wrapper(_run)
+    except KeyboardInterrupt:
+        return 130
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    fresh = parse_cache_flags(args)
+    tui = "--tui" in args
+    json_mode = "--json" in args
+    if tui and json_mode:
+        print("llm-usage: --tui cannot be combined with --json",
+              file=sys.stderr)
+        sys.exit(2)
+    if json_mode:
+        sys.exit(emit_json())
+    if tui:
+        if not sys.stdout.isatty():
+            print("llm-usage: --tui requires an interactive terminal",
+                  file=sys.stderr)
+            sys.exit(2)
+        sys.exit(run_tui(initial_fresh=fresh))
+
+    width = shutil.get_terminal_size((100, 24)).columns
+    _snapshot, lines, exit_code = render_dashboard(width, clamp_width=True)
+    for line in lines:
+        print(line)
+    if exit_code:
+        sys.exit(exit_code)
 
 
 if __name__ == "__main__":

@@ -53,6 +53,25 @@ ln -s "$PWD/llm-usage" ~/bin/llm-usage
 
 Requirements: **Python 3.8+**, nothing else — no third-party packages.
 
+## Interactive TUI
+
+Run `llm-usage --tui` for an interactive, full-terminal view. It uses Python's
+stdlib `curses` module, so it requires an interactive terminal; if stdout is not
+a TTY, it exits with code `2`.
+
+The TUI adapts to the live window width and scrolls vertically when the content
+is taller than the window. Controls: `↑`/`k`, `↓`/`j`, `PageUp`, `PageDown`,
+`Home`, `End`, mouse wheel when supported, and `q`, `Esc`, or `Ctrl-C` to quit.
+
+Data refreshes happen when the relevant cache or rate-limit backoff window
+expires. The screen also repaints every 60 seconds, plus immediately on resize
+or scroll, so countdowns like OAuth expiry, reset times, and cached-response
+ages stay current without extra API calls.
+
+`--tui` and `--json` are mutually exclusive; combining them exits with code `2`.
+`--fresh` works with `--tui` as an initial cache-read bypass only, then the TUI
+returns to normal cache-aware refresh behavior.
+
 ## Authentication
 
 The tool reuses the OAuth credentials your existing CLI logins already created. No separate setup is needed if you use Claude Code and/or the Codex CLI.
