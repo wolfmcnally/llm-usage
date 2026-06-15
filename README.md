@@ -3,13 +3,8 @@
 A terminal dashboard for your **Anthropic (Claude)** and **OpenAI (ChatGPT/Codex)** subscription rate limits — the same numbers Claude Code's `/usage` command and the Codex CLI report, side by side, sized to your terminal.
 
 ```text
-Used: █ ok  █ 50%  █ 75%  █ 90%
-Pace: ▼ under  ▼ on  ▼ over
-
-ANTHROPIC  Claude MAX plan                                   Wed Jun 03 13:51 MDT
+ANTHROPIC  Claude Max Plan  [⚠ OAuth expires in 3h 19m]      Wed Jun 03 13:51 MDT
 ──────────────────────────────────────────────────────────────────────────────────
-  OAuth token expires in 7h 19m (Wed Jun 03 21:11 MDT)
-
                                           ▼
 7-day overall     ███████████████████████████████░░░░░░░░░░░░░░░░░░░░░░░    57%
                   resets Sun Jun 07 10:02 MDT  ·  in 3d 20h  ·  window 45% elapsed   ↑ +12pp over pace
@@ -19,9 +14,12 @@ ANTHROPIC  Claude MAX plan                                   Wed Jun 03 13:51 MD
 
 ══════════════════════════════════════════════════════════════════════════════════
 
-OPENAI  ChatGPT Pro plan                                     Wed Jun 03 13:52 MDT
+OPENAI  ChatGPT Pro Plan                                     Wed Jun 03 13:52 MDT
 ──────────────────────────────────────────────────────────────────────────────────
   ...
+
+Used: █ ok  █ 50%  █ 75%  █ 90%
+Pace: ▼ under  ▼ on  ▼ over
 ```
 
 ## Reading the display
@@ -41,7 +39,9 @@ The relationship between the two is the real signal:
 
 Each band also shows its reset time (local), time remaining, and window-elapsed percentage. A red `↑` after a bar means usage reported over 100%.
 
-OAuth token expiry is shown for both providers, with escalating warnings inside 7 days and inside 1 hour.
+OAuth token expiry is shown only when a provider token is expired or has 4 hours
+or less remaining, with a red warning inside 1 hour. Expiry and cache notices
+appear inline on the provider title line.
 
 ## Installation
 
@@ -91,10 +91,10 @@ Tokens are read locally and sent only to the respective vendor's own API. OpenAI
 
 ## Caching
 
-The undocumented usage endpoints are rate-limited, so `llm-usage` calls each provider's API **at most once every ten minutes**. Every successful response is cached on disk per provider; any run inside the TTL is served from cache with no network call and annotated `↻ cached Nm ago` under the section.
+The undocumented usage endpoints are rate-limited, so `llm-usage` calls each provider's API **at most once every ten minutes**. Every successful response is cached on disk per provider; any run inside the TTL is served from cache with no network call and annotated `↻ cached Nm ago` on the provider title line.
 
 - **Success TTL:** 600 seconds (10 minutes) by default. Override with `LLM_USAGE_CACHE_TTL=<seconds>` (set `0` to disable caching entirely).
-- **Rate-limit backoff:** if a provider returns **429**, that's *negatively* cached for **20 minutes** by default — the tool makes **no new call** to that provider for the whole window, so repeatedly running it won't keep poking a limited endpoint and prolong the block. The section shows `● rate limited (429) … retry in Nm` instead. Override with `LLM_USAGE_RATE_LIMIT_TTL=<seconds>`.
+- **Rate-limit backoff:** if a provider returns **429**, that's *negatively* cached for **20 minutes** by default — the tool makes **no new call** to that provider for the whole window, so repeatedly running it won't keep poking a limited endpoint and prolong the block. The provider title line shows `● rate limited (429) … retry in Nm` instead. Override with `LLM_USAGE_RATE_LIMIT_TTL=<seconds>`.
 - **Bypass for one run:** `llm-usage --fresh` (alias `--no-cache`, or `LLM_USAGE_NO_CACHE=1`) hits the APIs live and refreshes the cache — including overriding an active 429 backoff.
 - **Other failures aren't cached** — a 401/network error retries on your next run rather than sticking around.
 - **Location:** `$XDG_CACHE_HOME/llm-usage/` (default `~/.cache/llm-usage/`).

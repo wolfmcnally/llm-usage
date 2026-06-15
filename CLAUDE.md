@@ -28,7 +28,8 @@ reads only for the initial data load; subsequent refreshes are cache-aware.
 TUI controls: `↑`/`k`, `↓`/`j`, `PageUp`, `PageDown`, `Home`, `End`, mouse wheel
 when supported, and `q`/`Esc`/`Ctrl-C` to quit. The TUI refetches data when
 cache/backoff deadlines expire, repaints every 60 seconds for countdowns and
-cache ages, and redraws without fetching on resize or scroll.
+cache ages, and redraws without fetching on resize or scroll. OAuth-expiry and
+cache-status notices render inline on the provider title line when present.
 
 There is no lint/test command. Verify changes by running the script directly. Note: the Anthropic endpoint occasionally returns a transient 429; that renders as an inline section error and exit code 1, not a bug.
 
@@ -41,7 +42,7 @@ To avoid hammering the undocumented (rate-limited) usage endpoints, responses ar
 - **Any other failure** (401, 5xx, network `None`) is **never** cached (`cached_fetch` only writes on `code in (200, 429)`), so it retries on the very next run.
 
 Display / output:
-- TUI: a dim `↻ cached Nm ago` line for a cached 200; an orange `● rate limited (429) … retry in Nm` line (`rate_limit_warn`) for a cached or live 429.
+- TUI/one-shot: optional OAuth-expiry and cache-status notices render inline on each provider title line. Cached 200s use dim `↻ cached Nm ago`; cached or live 429s use orange `● rate limited (429) … retry in Nm`.
 - `--json`: each provider object carries `cached` (bool), `cache_age_seconds`, and `rate_limited` (bool, present on the error path).
 
 Overrides:
@@ -60,7 +61,7 @@ Writes are atomic (`os.replace` of a pid-suffixed temp file) and entirely best-e
 
 Top-to-bottom pipeline, one section per provider, each failing independently:
 
-1. **Token loaders** (`load_anthropic_token`, `load_codex_token`) — chain of sources: env var → macOS Keychain (`security find-generic-password`, Anthropic only) → credential file (`~/.claude/.credentials.json` / `~/.codex/auth.json`). Codex token expiry comes from locally decoding the access token's JWT `exp` claim (`jwt_claims` — unverified by design, inspection only).
+1. **Token loaders** (`load_anthropic_token`, `load_codex_token`) — chain of sources: env var → macOS Keychain (`security find-generic-password`, Anthropic only) → credential file (`~/.claude/.credentials.json` / `~/.codex/auth.json`). Codex token expiry comes from locally decoding the access token's JWT `exp` claim (`jwt_claims` — unverified by design, inspection only). OAuth expiry warnings render only when the token is expired or has 4 hours or less remaining.
 2. **Fetchers** (`fetch_anthropic`, `fetch_codex`) — GET the undocumented usage endpoints (`api.anthropic.com/api/oauth/usage`, `chatgpt.com/backend-api/wham/usage`) via `http_get_json`, which never raises: it returns `(status_or_None, body)`.
 3. **Snapshots + sections** (`anthropic_snapshot` / `openai_snapshot`, then `render_anthropic_section` / `render_openai_section`) — each provider fetch/load happens once per data refresh, then renders independently and degrades any failure (no token, 401, API error) to an inline `warn_line` so the other section still renders. The two providers' response shapes differ: Anthropic returns named bands (`five_hour`, `seven_day`, `seven_day_opus`, …) with `utilization` + `resets_at` ISO timestamps; OpenAI returns `rate_limit.{primary,secondary}_window` with `used_percent` + window/reset seconds.
 4. **Row renderer** (`row`) — the core visual idea: each band is a 3-line block where line 0 places a `▼` at the percent-of-window-elapsed position above a usage bar (line 1), so bar-end vs. `▼` position *is* the over/under-pace signal. Pace verdict (±5pp threshold) colors both the `▼` and the trailing annotation.

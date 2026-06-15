@@ -414,16 +414,15 @@ def cached_fetch(provider: str, fetch_fn, tok: dict
     return code, body, None
 
 
-def cache_note_line(code: int | None, age: float | None) -> str | None:
-    """Return a dim 'served from cache' annotation for a cached success.
+def cache_notice(code: int | None, age: float | None) -> str | None:
+    """Return a dim 'served from cache' header annotation for a cached success.
 
     Cached 429s are surfaced by the sections' rate-limit branch instead, so
     this stays quiet for them.
     """
     if age is None or code != 200:
         return None
-    return (f"  {DIM}↻ cached {fmt_relative(age)} ago "
-            f"(refreshes after {fmt_relative(cache_ttl())}){RESET}")
+    return f"{DIM}[↻ cached {fmt_relative(age)} ago]{RESET}"
 
 
 # ----------------------------------------------------------- bar render ----
@@ -561,15 +560,28 @@ def row(label: str, usage_pct: float, now_pct: float | None,
 
 # -------------------------------------------------------------- header ----
 
-def section_header(title: str, plan: str, width: int) -> list[str]:
-    left = f"{BOLD}{title}{RESET}"
+def section_header(title: str, plan: str, width: int,
+                   notices: list[str | None] | None = None) -> list[str]:
+    left_parts = [f"{BOLD}{title}{RESET}"]
     if plan and width >= 48:
-        left += f"  {DIM}{plan}{RESET}"
+        left_parts.append(f"{DIM}{plan}{RESET}")
+    notice_parts = [n for n in (notices or []) if n]
     now_str = datetime.now().astimezone().strftime("%a %b %d %H:%M %Z")
     if width < 48:
+        left_parts.extend(notice_parts)
+        left = "  ".join(left_parts)
         line = left
     else:
+        max_left = max(0, width - len(now_str) - 1)
+        left = "  ".join(left_parts)
+        for notice in notice_parts:
+            candidate = f"{left}  {notice}"
+            if visible_len(candidate) <= max_left:
+                left = candidate
         pad = width - visible_len(left) - len(now_str)
+        if pad < 1:
+            left = clip_ansi(left, max(0, width - len(now_str) - 1))
+            pad = width - visible_len(left) - len(now_str)
         if pad < 1:
             line = left
         else:
@@ -581,35 +593,32 @@ def warn_line(msg: str) -> str:
     return f"  {fg256(203)}✖ {msg}{RESET}"
 
 
-def rate_limit_warn_line(age: float | None) -> str:
+def rate_limit_notice(age: float | None) -> str:
     """Report a 429 backoff. age=None means we hit it live this render."""
     if age is None:
-        return (f"  {fg256(214)}● rate limited (429) — holding off new calls for "
-                f"{fmt_relative(rate_limit_ttl())} "
-                f"({DIM}--fresh to override{RESET}{fg256(214)}){RESET}")
+        return (f"{fg256(214)}[● rate limited (429), retry in "
+                f"{fmt_relative(rate_limit_ttl())}]{RESET}")
     remaining = max(0.0, rate_limit_ttl() - age)
-    return (f"  {fg256(214)}● rate limited (429) {fmt_relative(age)} ago — "
-            f"holding off, retry in {fmt_relative(remaining)} "
-            f"({DIM}--fresh to override{RESET}{fg256(214)}){RESET}")
+    return (f"{fg256(214)}[● rate limited (429), retry in "
+            f"{fmt_relative(remaining)}]{RESET}")
 
 
-def token_expiry_line(expires_at_ms: int | None) -> tuple[str, bool]:
-    """Return the OAuth-token-expiry line and whether it is already expired."""
+def token_expiry_notice(expires_at_ms: int | None) -> tuple[str | None, bool]:
+    """Return an OAuth-expiry header annotation and whether it is expired."""
     if expires_at_ms is None:
-        return f"  {DIM}token expiry unknown{RESET}", False
+        return None, False
     exp = datetime.fromtimestamp(expires_at_ms / 1000, tz=timezone.utc)
     secs = (exp - datetime.now(timezone.utc)).total_seconds()
     if secs <= 0:
-        return (f"  {fg256(203)}✖ OAuth token expired {fmt_relative(-secs)} "
-                f"ago ({fmt_local(exp)}){RESET}", True)
+        return (f"{fg256(203)}[✖ OAuth expired {fmt_relative(-secs)} "
+                f"ago]{RESET}", True)
+    if secs > 4 * 3600:
+        return None, False
     if secs < 3600:
-        prefix = f"{fg256(203)}⚠ "
-    elif secs < 7 * 86400:
-        prefix = f"{fg256(214)}⚠ "
+        color = fg256(203)
     else:
-        prefix = SUB_FG
-    return (f"  {prefix}OAuth token expires in {fmt_relative(secs)} "
-            f"({fmt_local(exp)}){RESET}", False)
+        color = fg256(214)
+    return (f"{color}[⚠ OAuth expires in {fmt_relative(secs)}]{RESET}", False)
 
 
 # ------------------------------------------------------------- sections ----
@@ -666,35 +675,32 @@ def render_anthropic_section(snapshot: dict, width: int) -> tuple[list[str], boo
                                "to login)"))
         return [clip_ansi(line, width) for line in lines], False
 
-    plan_label = (tok.get("subscription") or "").upper()
-    lines.extend(section_header(
-        "ANTHROPIC",
-        f"Claude {plan_label} plan" if plan_label else "Claude",
-        width,
-    ))
-    expiry, expired = token_expiry_line(tok.get("expires_at_ms"))
-    lines.append(expiry)
-
     code = snapshot.get("code")
     body = snapshot.get("body") or {}
-    age = displayed_cache_age(snapshot)
-    note = cache_note_line(code, age)
-    if note:
-        lines.append(note)
+    expiry, expired = token_expiry_notice(tok.get("expires_at_ms"))
+    if code == 429:
+        status = rate_limit_notice(
+            displayed_cache_age(snapshot, include_live_429=True))
+    else:
+        status = cache_notice(code, displayed_cache_age(snapshot))
+    plan_label = (tok.get("subscription") or "").title()
+    lines.extend(section_header(
+        "ANTHROPIC",
+        f"Claude {plan_label} Plan" if plan_label else "Claude",
+        width,
+        [status, expiry],
+    ))
     if code == 401:
         lines.append(warn_line("token rejected (401)"
                                + (" — expired" if expired else "")
                                + "; run `claude` to refresh"))
         return [clip_ansi(line, width) for line in lines], False
     if code == 429:
-        lines.append(rate_limit_warn_line(
-            displayed_cache_age(snapshot, include_live_429=True)))
         return [clip_ansi(line, width) for line in lines], False
     if code != 200:
         lines.append(warn_line(f"API error {code}: {json.dumps(body)[:200]}"))
         return [clip_ansi(line, width) for line in lines], False
 
-    lines.append("")
     now = datetime.now(timezone.utc)
     bands = [
         ("7-day overall", body.get("seven_day"), 7 * 86400),
@@ -763,17 +769,18 @@ def render_openai_section(snapshot: dict, width: int) -> tuple[list[str], bool]:
     code = snapshot.get("code")
     body = snapshot.get("body") or {}
     plan = (body.get("plan_type") or "").title() if code == 200 else ""
+    expiry, expired = token_expiry_notice(tok.get("expires_at_ms"))
+    if code == 429:
+        status = rate_limit_notice(
+            displayed_cache_age(snapshot, include_live_429=True))
+    else:
+        status = cache_notice(code, displayed_cache_age(snapshot))
     lines.extend(section_header(
         "OPENAI",
-        f"ChatGPT {plan} plan" if plan else "ChatGPT",
+        f"ChatGPT {plan} Plan" if plan else "ChatGPT",
         width,
+        [status, expiry],
     ))
-    expiry, expired = token_expiry_line(tok.get("expires_at_ms"))
-    lines.append(expiry)
-    age = displayed_cache_age(snapshot)
-    note = cache_note_line(code, age)
-    if note:
-        lines.append(note)
 
     if code == 401:
         lines.append(warn_line("token rejected (401)"
@@ -781,14 +788,11 @@ def render_openai_section(snapshot: dict, width: int) -> tuple[list[str], bool]:
                                + "; run `codex` to refresh"))
         return [clip_ansi(line, width) for line in lines], False
     if code == 429:
-        lines.append(rate_limit_warn_line(
-            displayed_cache_age(snapshot, include_live_429=True)))
         return [clip_ansi(line, width) for line in lines], False
     if code != 200:
         lines.append(warn_line(f"API error {code}: {json.dumps(body)[:200]}"))
         return [clip_ansi(line, width) for line in lines], False
 
-    lines.append("")
     rl = body.get("rate_limit") or {}
     if rl.get("limit_reached"):
         lines.append(f"  {fg256(203)}● limit reached — requests will be rejected"
@@ -933,18 +937,20 @@ def legend_lines() -> list[str]:
         f"{WHITE}{NOW_MARK}{RESET} on  "
         f"{fg256(203)}{NOW_MARK}{RESET} over"
     )
-    return ["", legend_used, legend_pace, ""]
+    return [legend_used, legend_pace]
 
 
 def render_dashboard_snapshot(snapshot: dict, columns: int,
                               clamp_width: bool) -> tuple[list[str], int]:
     width = display_width(columns, clamp_width)
-    lines = legend_lines()
+    lines = []
     a_lines, a_ok = render_anthropic_section(snapshot["anthropic"], width)
     lines.extend(a_lines)
     lines.extend(["", RULE_FG + "═" * width + RESET, ""])
     o_lines, o_ok = render_openai_section(snapshot["openai"], width)
     lines.extend(o_lines)
+    lines.append("")
+    lines.extend(legend_lines())
     lines.append("")
     return [clip_ansi(line, width) for line in lines], dashboard_exit_code(a_ok, o_ok)
 
