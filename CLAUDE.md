@@ -37,7 +37,7 @@ There is no lint/test command. Verify changes by running the script directly. No
 
 To avoid hammering the undocumented (rate-limited) usage endpoints, responses are cached on disk per provider under `$XDG_CACHE_HOME/llm-usage` (default `~/.cache/llm-usage/{anthropic,openai}.json`). Two TTLs apply, keyed off the cached HTTP status (`cache_read` picks the TTL by the stored `code`):
 
-- **Success (HTTP 200)** → cached for `cache_ttl()`, default **600s (10 min)**. Any run within the window is served with **no network call**, so the real APIs are hit at most once every ten minutes per provider.
+- **Success (HTTP 200)** → cached for `cache_ttl(provider)`, default **600s (10 min) for OpenAI** and **1200s (20 min) for Anthropic** (`ANTHROPIC_CACHE_TTL`; its endpoint rate-limits harder, so we poll it half as often). Any run within the window is served with **no network call**, so the real API is hit at most once per success window per provider.
 - **Rate-limit (HTTP 429)** → **negatively** cached for `rate_limit_ttl()`, default **1200s (20 min)**. Once a provider returns 429, `cached_fetch` writes that 429 and *no new call* is made for the backoff window — re-running the tool won't keep poking a limited endpoint. The section reports the backoff and time remaining instead.
 - **Any other failure** (401, 5xx, network `None`) is **never** cached (`cached_fetch` only writes on `code in (200, 429)`), so it retries on the very next run.
 
@@ -46,7 +46,7 @@ Display / output:
 - `--json`: each provider object carries `cached` (bool), `cache_age_seconds`, and `rate_limited` (bool, present on the error path).
 
 Overrides:
-- `LLM_USAGE_CACHE_TTL=<seconds>` — success window; `0` (or ≤0) disables **all** caching (success *and* negative).
+- `LLM_USAGE_CACHE_TTL=<seconds>` — success window; when set, takes manual control and applies to **both** providers as-is (overriding the per-provider defaults of 600s OpenAI / 1200s Anthropic). `0` (or ≤0) disables **all** caching (success *and* negative).
 - `LLM_USAGE_RATE_LIMIT_TTL=<seconds>` — 429 backoff window; independent of the success TTL.
 - `--fresh` / `--no-cache` / `LLM_USAGE_NO_CACHE=1` — bypass cache reads for one run (still refreshes the cache on a 200 or 429).
 

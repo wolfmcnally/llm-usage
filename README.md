@@ -91,9 +91,9 @@ Tokens are read locally and sent only to the respective vendor's own API. OpenAI
 
 ## Caching
 
-The undocumented usage endpoints are rate-limited, so `llm-usage` calls each provider's API **at most once every ten minutes**. Every successful response is cached on disk per provider; any run inside the TTL is served from cache with no network call and annotated `↻ cached Nm ago` on the provider title line.
+The undocumented usage endpoints are rate-limited, so `llm-usage` calls each provider's API **at most once per success window**. Every successful response is cached on disk per provider; any run inside the TTL is served from cache with no network call and annotated `↻ cached Nm ago` on the provider title line.
 
-- **Success TTL:** 600 seconds (10 minutes) by default. Override with `LLM_USAGE_CACHE_TTL=<seconds>` (set `0` to disable caching entirely).
+- **Success TTL:** provider-specific by default — **600 seconds (10 minutes) for OpenAI**, but **1200 seconds (20 minutes) for Anthropic**, whose usage endpoint rate-limits more aggressively. Override with `LLM_USAGE_CACHE_TTL=<seconds>`, which takes manual control and applies to **both** providers as-is (set `0` to disable caching entirely).
 - **Rate-limit backoff:** if a provider returns **429**, that's *negatively* cached for **20 minutes** by default — the tool makes **no new call** to that provider for the whole window, so repeatedly running it won't keep poking a limited endpoint and prolong the block. The provider title line shows `● rate limited (429) … retry in Nm` instead. Override with `LLM_USAGE_RATE_LIMIT_TTL=<seconds>`.
 - **Bypass for one run:** `llm-usage --fresh` (alias `--no-cache`, or `LLM_USAGE_NO_CACHE=1`) hits the APIs live and refreshes the cache — including overriding an active 429 backoff.
 - **Other failures aren't cached** — a 401/network error retries on your next run rather than sticking around.

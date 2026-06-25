@@ -34,9 +34,11 @@ inline error line in that section while the other still renders fully.
 Exit codes: 0 = both providers OK, 1 = one provider failed, 2 = both failed.
 
 Caching: each successful API response is cached on disk per provider, and a
-subsequent run within the TTL (default 600s = 10 minutes) is served from that
-cache without touching the network — so the real endpoints are hit at most once
-every ten minutes no matter how often you run this. A 429 (rate-limit) response
+subsequent run within the TTL is served from that cache without touching the
+network — so the real endpoints are hit at most once per success window no
+matter how often you run this. That window is provider-specific by default:
+600s (10 minutes) for OpenAI, but 1200s (20 minutes) for Anthropic, whose usage
+endpoint rate-limits more aggressively. A 429 (rate-limit) response
 is *negatively* cached for a longer window (default 1200s = 20 minutes): once a
 provider says we're rate-limited, no new call is made for that window, so
 re-running the tool won't keep poking a limited endpoint — it just reports the
@@ -280,8 +282,9 @@ def fetch_codex(tok: dict) -> tuple[int | None, Any]:
 # The undocumented usage endpoints are rate-limited and return 429s under load,
 # so we hit them at most once per TTL window per provider. Two TTLs apply:
 #
-#   * Success (HTTP 200): cached for cache_ttl() (default 10 minutes). Any run
-#     within the window reuses the response without a network call.
+#   * Success (HTTP 200): cached for cache_ttl() — default 10 minutes for
+#     OpenAI, 20 minutes for Anthropic (its endpoint rate-limits harder). Any
+#     run within the window reuses the response without a network call.
 #   * Rate-limit (HTTP 429): NEGATIVELY cached for rate_limit_ttl() (default
 #     20 minutes). Once we're told we're rate-limited, we make no new call for
 #     the whole negative window — repeatedly running the tool won't keep poking
@@ -292,7 +295,10 @@ def fetch_codex(tok: dict) -> tuple[int | None, Any]:
 # cached_fetch(). --fresh/--no-cache (or LLM_USAGE_NO_CACHE) bypass reads;
 # LLM_USAGE_CACHE_TTL=0 disables caching entirely.
 
-DEFAULT_CACHE_TTL = 600        # seconds — success: "once per ten minutes"
+DEFAULT_CACHE_TTL = 600        # seconds — generic/OpenAI success: "once per ten minutes"
+ANTHROPIC_CACHE_TTL = 1200     # seconds — Anthropic success: doubled. Its usage
+                               # endpoint 429s harder under load, so we poll it
+                               # at most half as often as the generic default.
 DEFAULT_RATE_LIMIT_TTL = 1200  # seconds — 429 backoff: "no new call for 20 min"
 DEFAULT_TUI_RETRY_SECONDS = 60
 TUI_REPAINT_SECONDS = 60
@@ -310,17 +316,28 @@ def _caching_off() -> bool:
     return False
 
 
-def cache_ttl() -> int:
-    """Success-cache TTL in seconds; 0 means caching is disabled."""
+def cache_ttl(provider: str | None = None) -> int:
+    """Success-cache TTL in seconds; 0 means caching is disabled.
+
+    This is the minimum delta between real (HTTP 200) calls to a provider's
+    usage endpoint — any run inside the window is served from cache. The default
+    is provider-specific: Anthropic's endpoint rate-limits more aggressively, so
+    its floor (ANTHROPIC_CACHE_TTL) is double the generic default. An explicit
+    LLM_USAGE_CACHE_TTL takes manual control and applies to every provider as-is.
+    """
     if _caching_off():
         return 0
+
+    def _default() -> int:
+        return ANTHROPIC_CACHE_TTL if provider == "anthropic" else DEFAULT_CACHE_TTL
+
     raw = os.environ.get("LLM_USAGE_CACHE_TTL")
     if raw is None:
-        return DEFAULT_CACHE_TTL
+        return _default()
     try:
         return int(raw)
     except ValueError:
-        return DEFAULT_CACHE_TTL
+        return _default()
 
 
 def rate_limit_ttl() -> int:
@@ -369,7 +386,7 @@ def cache_read(provider: str) -> tuple[int | None, Any, float] | None:
     if not isinstance(ts, (int, float)):
         return None
     code = d.get("code")
-    ttl = rate_limit_ttl() if code == 429 else cache_ttl()
+    ttl = rate_limit_ttl() if code == 429 else cache_ttl(provider)
     if ttl <= 0:
         return None
     age = time.time() - ts
@@ -624,9 +641,10 @@ def token_expiry_notice(expires_at_ms: int | None) -> tuple[str | None, bool]:
 # ------------------------------------------------------------- sections ----
 
 def next_data_refresh_deadline(code: int | None, age: float | None,
-                               loaded_at: float) -> float:
+                               loaded_at: float,
+                               provider: str | None = None) -> float:
     if code == 200:
-        ttl = cache_ttl()
+        ttl = cache_ttl(provider)
     elif code == 429:
         ttl = rate_limit_ttl()
     else:
@@ -661,7 +679,8 @@ def anthropic_snapshot() -> dict:
     code, body, age = cached_fetch("anthropic", fetch_anthropic, tok)
     return {"provider": "anthropic", "token": tok, "code": code,
             "body": body, "age": age, "loaded_at": loaded_at,
-            "deadline": next_data_refresh_deadline(code, age, loaded_at)}
+            "deadline": next_data_refresh_deadline(code, age, loaded_at,
+                                                   "anthropic")}
 
 
 def render_anthropic_section(snapshot: dict, width: int) -> tuple[list[str], bool]:
@@ -740,7 +759,8 @@ def openai_snapshot() -> dict:
     code, body, age = cached_fetch("openai", fetch_codex, tok)
     return {"provider": "openai", "token": tok, "code": code,
             "body": body, "age": age, "loaded_at": loaded_at,
-            "deadline": next_data_refresh_deadline(code, age, loaded_at)}
+            "deadline": next_data_refresh_deadline(code, age, loaded_at,
+                                                   "openai")}
 
 
 def adjusted_openai_reset_seconds(snapshot: dict, window: dict
