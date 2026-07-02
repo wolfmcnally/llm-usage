@@ -668,6 +668,31 @@ def displayed_cache_age(snapshot: dict, include_live_429: bool = False
     return None
 
 
+def scoped_weekly_bands(body: dict) -> list[tuple[str, dict, int]]:
+    """Model/surface-scoped weekly limits from the newer `limits` array.
+
+    The API moved per-model weekly bands (the old `seven_day_opus`-style
+    top-level keys, which now come back null) into `limits` entries of kind
+    `weekly_scoped`, whose scope names the model — e.g. what Claude Code's
+    /usage shows as "Current Week (Fable)". Normalize each to the
+    (label, {utilization, resets_at}, window_seconds) shape row() expects.
+    """
+    bands = []
+    for lim in body.get("limits") or []:
+        if lim.get("kind") != "weekly_scoped":
+            continue
+        scope = lim.get("scope") or {}
+        model = (scope.get("model") or {}).get("display_name")
+        what = model or scope.get("surface") or "scoped"
+        bands.append((
+            f"7-day {what}",
+            {"utilization": lim.get("percent", 0),
+             "resets_at": lim.get("resets_at")},
+            7 * 86400,
+        ))
+    return bands
+
+
 def anthropic_snapshot() -> dict:
     loaded_at = time.time()
     tok = load_anthropic_token()
@@ -721,14 +746,15 @@ def render_anthropic_section(snapshot: dict, width: int) -> tuple[list[str], boo
         return [clip_ansi(line, width) for line in lines], False
 
     now = datetime.now(timezone.utc)
-    bands = [
-        ("7-day overall", body.get("seven_day"), 7 * 86400),
-        ("5-hour", body.get("five_hour"), 5 * 3600),
+    bands = [("7-day overall", body.get("seven_day"), 7 * 86400)]
+    bands.extend(scoped_weekly_bands(body))
+    bands.extend([
         ("7-day Sonnet", body.get("seven_day_sonnet"), 7 * 86400),
         ("7-day Opus", body.get("seven_day_opus"), 7 * 86400),
         ("7-day OAuth apps", body.get("seven_day_oauth_apps"), 7 * 86400),
         ("7-day cowork", body.get("seven_day_cowork"), 7 * 86400),
-    ]
+        ("5-hour", body.get("five_hour"), 5 * 3600),
+    ])
     printed = 0
     for label, data, window_s in bands:
         if not data:
@@ -876,6 +902,16 @@ def _anthropic_json() -> dict:
             continue
         reset_dt = parse_iso(d.get("resets_at"))
         rem = (reset_dt - now).total_seconds() if reset_dt else None
+        windows[key] = {
+            "utilization": float(d.get("utilization", 0)),
+            "resets_at": d.get("resets_at"),
+            "reset_seconds": rem,
+        }
+    for label, d, _wnd in scoped_weekly_bands(a):
+        reset_dt = parse_iso(d.get("resets_at"))
+        rem = (reset_dt - now).total_seconds() if reset_dt else None
+        name = label[len("7-day "):] if label.startswith("7-day ") else label
+        key = "seven_day_" + name.lower().replace(" ", "_")
         windows[key] = {
             "utilization": float(d.get("utilization", 0)),
             "resets_at": d.get("resets_at"),
