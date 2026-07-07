@@ -4,8 +4,8 @@ llm-usage — terminal dashboard for Anthropic + OpenAI subscription rate limits
 
 Pulls the same numbers Claude Code's `/usage` and Codex CLI report, sized to the
 current terminal. Each row shows:
-    colored bar  = % of the limit consumed
-    ▼ above the bar = % of the time window elapsed (i.e. *now*)
+    colored bar      = % of the limit consumed
+    label + ▼ marker = % of the time window elapsed (i.e. *now*)
 The relationship between the two is the actual signal, and the ▼ is colored
 to match the over/under/on-pace verdict:
     bar ends past the ▼   → over-pace (red ▼), will hit the limit early
@@ -517,22 +517,50 @@ def label_width(width: int) -> int:
     return 18
 
 
+def row_layout_widths(labels: list[str], usage_pcts: list[float],
+                      width: int) -> tuple[int, int]:
+    label_gap_w = 2
+    bar_gap_w = 1
+    overflow_w = 2
+    min_bar = 4 if width < 46 else 8
+    pct_w = max((len(f"{pct:.0f}%") for pct in usage_pcts), default=3)
+    max_label_w = max(
+        1,
+        width - label_gap_w - pct_w - bar_gap_w - overflow_w - min_bar,
+    )
+    if not labels:
+        return min(label_width(width), max_label_w), pct_w
+    return min(max(len(label) for label in labels), max_label_w), pct_w
+
+
 def row(label: str, usage_pct: float, now_pct: float | None,
         reset_dt: datetime | None, reset_seconds: float | None,
-        width: int, label_w: int | None = None) -> str:
+        width: int, label_w: int | None = None,
+        pct_w: int | None = None) -> str:
     label_w = label_width(width) if label_w is None else label_w
-    pct_str = f"{usage_pct:4.0f}%"
-    min_bar = 4 if width < 46 else 8
-    bar_w = max(min_bar, width - label_w - len(pct_str) - 2)
-    bar, overflow = render_bar(bar_w, usage_pct)
     raw_label = fit_text(label, label_w)
-    lbl = f"{BOLD}{raw_label:<{label_w}}{RESET}"
+    label_gap_w = 2
+    label_col_w = label_w + label_gap_w
+    pct_text = f"{usage_pct:.0f}%"
+    pct_col_w = max(pct_w if pct_w is not None else 0, len(pct_text))
+    pct_str = f"{pct_text:<{pct_col_w}}"
+    bar_gap_w = 1
+    overflow_w = 2
+    min_bar = 4 if width < 46 else 8
+    bar_w = max(min_bar,
+                width - label_col_w - pct_col_w - bar_gap_w - overflow_w)
+    bar, overflow = render_bar(bar_w, usage_pct)
+    lbl = f"{BOLD}{raw_label:<{label_w}}{RESET}{' ' * label_gap_w}"
     pct_color = color_for_pct(usage_pct)
     overflow_mark = f" {fg256(203)}↑{RESET}" if overflow else "  "
-    line1 = f"{lbl}{bar}{overflow_mark}{pct_color}{pct_str}{RESET}"
+    line1 = f"{lbl}{pct_color}{pct_str}{RESET} {bar}{overflow_mark}"
+    bar_start = label_col_w + pct_col_w + bar_gap_w
 
     line0 = ""
-    pace = ""
+    countdown_text = (
+        f"in {fmt_relative(reset_seconds)}"
+        if reset_seconds is not None else None
+    )
     if now_pct is not None:
         margin = usage_pct - now_pct
         if usage_pct >= now_pct + 5:
@@ -545,33 +573,75 @@ def row(label: str, usage_pct: float, now_pct: float | None,
             pace_color = WHITE
             verdict = "on pace"
         if verdict == "on pace":
-            pace = f"   {pace_color}≈ on pace{RESET}"
+            pace_text = "≈ on pace"
         elif width < 64:
             arrow = "↑" if verdict == "over pace" else "↓"
-            pace = f"   {pace_color}{arrow} {margin:+.0f}pp{RESET}"
+            pace_text = f"{arrow} {margin:+.0f}pp"
         else:
             arrow = "↑" if verdict == "over pace" else "↓"
-            pace = f"   {pace_color}{arrow} {margin:+.0f}pp {verdict}{RESET}"
+            pace_text = f"{arrow} {margin:+.0f}pp {verdict}"
         now_idx = min(max(0, round(now_pct / 100 * bar_w)), bar_w - 1)
-        line0 = " " * (label_w + now_idx) + pace_color + NOW_MARK + RESET
+        marker_col = bar_start + now_idx
+        now_label = f"{now_pct:.0f}%"
+        marker_pad = "  "
+        segment_sep = " · "
+        left_segments = []
+        right_segments = []
 
-    parts = []
-    if reset_dt and width >= 84:
-        parts.append(f"resets {fmt_local(reset_dt)}")
-    if reset_seconds is not None:
-        parts.append(f"in {fmt_relative(reset_seconds)}")
-    if now_pct is not None and width >= 58:
-        parts.append(f"window {now_pct:.0f}% elapsed")
-    if width < 44:
-        pace = ""
-    if not parts and not pace:
-        return clip_ansi(line0, width) + "\n" + clip_ansi(line1, width)
-    sub = SUB_FG + "  ·  ".join(parts) + RESET + pace
-    line2 = f"{' ' * label_w}{sub}"
+        def joined_text(segments: list[tuple[str, str]]) -> str:
+            return segment_sep.join(text for text, _color in segments)
+
+        def left_text(segments: list[tuple[str, str]]) -> str:
+            if segments:
+                return now_label + " " + joined_text(segments) + marker_pad
+            return now_label + marker_pad
+
+        def right_text(segments: list[tuple[str, str]]) -> str:
+            if segments:
+                return marker_pad + joined_text(segments)
+            return ""
+
+        right_capacity = width - marker_col - len(NOW_MARK)
+        for segment in [(pace_text, pace_color), (countdown_text, SUB_FG)]:
+            text, color = segment
+            if not text:
+                continue
+            candidate = right_segments + [(text, color)]
+            if len(right_text(candidate)) <= right_capacity:
+                right_segments = candidate
+                continue
+            candidate = left_segments + [(text, color)]
+            if len(left_text(candidate)) <= marker_col:
+                left_segments = candidate
+
+        def colored_segments(segments: list[tuple[str, str]]) -> str:
+            out = []
+            for i, (text, color) in enumerate(segments):
+                if i:
+                    out.append(SUB_FG + segment_sep + RESET)
+                out.append(color + text + RESET)
+            return "".join(out)
+
+        left = pace_color + now_label + RESET
+        if left_segments:
+            left += " " + colored_segments(left_segments)
+        left += marker_pad
+        right = ""
+        if right_segments:
+            right = marker_pad + colored_segments(right_segments)
+        marker_start = marker_col - visible_len(left)
+        line0 = (
+            " " * marker_start
+            + left
+            + pace_color + NOW_MARK + RESET
+            + right
+        )
+    elif countdown_text:
+        line0 = " " * bar_start + SUB_FG + countdown_text + RESET
+
     return "\n".join([
         clip_ansi(line0, width),
         clip_ansi(line1, width),
-        clip_ansi(line2, width),
     ])
 
 
@@ -755,10 +825,16 @@ def render_anthropic_section(snapshot: dict, width: int) -> tuple[list[str], boo
         ("7-day cowork", body.get("seven_day_cowork"), 7 * 86400),
         ("5-hour", body.get("five_hour"), 5 * 3600),
     ])
+    visible_bands = [(label, data, window_s)
+                     for label, data, window_s in bands if data]
+    label_w, pct_w = row_layout_widths(
+        [label for label, _data, _window_s in visible_bands],
+        [float(data.get("utilization", 0))
+         for _label, data, _window_s in visible_bands],
+        width,
+    )
     printed = 0
-    for label, data, window_s in bands:
-        if not data:
-            continue
+    for label, data, window_s in visible_bands:
         usage = float(data.get("utilization", 0))
         reset_dt = parse_iso(data.get("resets_at"))
         if reset_dt:
@@ -767,7 +843,8 @@ def render_anthropic_section(snapshot: dict, width: int) -> tuple[list[str], boo
         else:
             rem = None
             now_pct = None
-        lines.extend(row(label, usage, now_pct, reset_dt, rem, width).splitlines())
+        lines.extend(row(label, usage, now_pct, reset_dt, rem, width,
+                         label_w, pct_w).splitlines())
         printed += 1
     if not printed:
         lines.append(f"  {DIM}(no usage data){RESET}")
@@ -846,8 +923,8 @@ def render_openai_section(snapshot: dict, width: int) -> tuple[list[str], bool]:
     elif not rl.get("allowed", True):
         lines.append(f"  {fg256(214)}⚠ requests not currently allowed{RESET}")
 
-    printed = 0
     # Weekly (secondary) window first — it's the limit that matters most.
+    window_rows = []
     for key, default_label in [
         ("secondary_window", "secondary"),
         ("primary_window", "primary"),
@@ -869,7 +946,17 @@ def render_openai_section(snapshot: dict, width: int) -> tuple[list[str], bool]:
         label = fmt_window(wnd_s) if wnd_s else default_label
         if key == "secondary_window":
             label = f"{label} (weekly)"
-        lines.extend(row(label, usage, now_pct, reset_dt, rem_s, width).splitlines())
+        window_rows.append((label, usage, now_pct, reset_dt, rem_s))
+
+    label_w, pct_w = row_layout_widths(
+        [label for label, _usage, _now_pct, _reset_dt, _rem_s in window_rows],
+        [usage for _label, usage, _now_pct, _reset_dt, _rem_s in window_rows],
+        width,
+    )
+    printed = 0
+    for label, usage, now_pct, reset_dt, rem_s in window_rows:
+        lines.extend(row(label, usage, now_pct, reset_dt, rem_s, width,
+                         label_w, pct_w).splitlines())
         printed += 1
     if not printed:
         lines.append(f"  {DIM}(no usage data){RESET}")

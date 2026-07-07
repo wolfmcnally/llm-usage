@@ -5,12 +5,10 @@ A terminal dashboard for your **Anthropic (Claude)** and **OpenAI (ChatGPT/Codex
 ```text
 ANTHROPIC  Claude Max Plan  [⚠ OAuth expires in 3h 19m]      Wed Jun 03 13:51 MDT
 ──────────────────────────────────────────────────────────────────────────────────
-                                          ▼
-7-day overall     ███████████████████████████████░░░░░░░░░░░░░░░░░░░░░░░    57%
-                  resets Sun Jun 07 10:02 MDT  ·  in 3d 20h  ·  window 45% elapsed   ↑ +12pp over pace
-                  ▼
-5-hour            ████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░    12%
-                  resets Wed Jun 03 18:02 MDT  ·  in 4h 10m  ·  window 16% elapsed   ↓ -4pp under pace
+                                           45%  ▼  ↑ +12pp over pace · in 3d 20h
+7-day overall  57% ███████████████████████████████░░░░░░░░░░░░░░░░░░░░░
+                          18%  ▼  ↓ -6pp under pace · in 4h 10m
+5-hour         12% ████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
 
 ══════════════════════════════════════════════════════════════════════════════════
 
@@ -27,7 +25,7 @@ Pace: ▼ under  ▼ on  ▼ over
 Each rate-limit band is a bar with a marker above it:
 
 - **The bar** shows what percentage of the limit you've consumed, colored green → yellow → orange → red as it fills.
-- **The `▼` marker** sits at the percentage of the *time window* that has elapsed — i.e., where "now" is.
+- **The `▼` marker** sits at the percentage of the *time window* that has elapsed — i.e., where "now" is, with that percentage printed to its left.
 
 The relationship between the two is the real signal:
 
@@ -37,7 +35,7 @@ The relationship between the two is the real signal:
 | Bar ends **before** the `▼` (green `▼`, `↓ under pace`) | Headroom — usage is slower than time |
 | Bar ends **at** the `▼` (white `▼`, `≈ on pace`) | Within ±5 percentage points of even burn |
 
-Each band also shows its reset time (local), time remaining, and window-elapsed percentage. A red `↑` after a bar means usage reported over 100%.
+Each band also shows its time remaining. A red `↑` after a bar means usage reported over 100%.
 
 OAuth token expiry is shown only when a provider token is expired or has 4 hours
 or less remaining, with a red warning inside 1 hour. Expiry and cache notices
