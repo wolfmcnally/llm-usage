@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A single-file, stdlib-only Python 3 terminal dashboard (`llm-usage`) that displays Anthropic (Claude) and OpenAI (ChatGPT/Codex) subscription rate-limit usage — the same numbers Claude Code's `/usage` and the Codex CLI report. There is no build system, no dependencies, no test suite. The entire project is the one executable script.
+A single-file, stdlib-only Python 3 runtime (`llm-usage`) that displays Anthropic (Claude) and OpenAI (ChatGPT/Codex) subscription rate-limit usage — the same numbers Claude Code's `/usage` and the Codex CLI report. OpenAI purchased-credit status, usage-limit reset count, and additional model/feature-specific limits are included when present. There is no build system or runtime dependency; `tests/` contains sanitized JSON fixtures and stdlib `unittest` coverage.
 
 `~/bin/llm-usage` is a symlink into this directory, so edits to the script are live immediately on the PATH.
 
@@ -31,7 +31,10 @@ cache/backoff deadlines expire, repaints every 60 seconds for countdowns and
 cache ages, and redraws without fetching on resize or scroll. OAuth-expiry and
 cache-status notices render inline on the provider title line when present.
 
-There is no lint/test command. Verify changes by running the script directly. Note: the Anthropic endpoint occasionally returns a transient 429; that renders as an inline section error and exit code 1, not a bug.
+Run `python3 -m unittest discover -s tests -v`, then verify display changes by
+running the script directly. Note: the Anthropic endpoint occasionally returns
+a transient 429; that renders as an inline section error and exit code 1, not a
+bug.
 
 ## Caching
 
@@ -43,7 +46,7 @@ To avoid hammering the undocumented (rate-limited) usage endpoints, responses ar
 
 Display / output:
 - TUI/one-shot: optional OAuth-expiry and cache-status notices render inline on each provider title line. Cached 200s use dim `↻ cached Nm ago`; cached or live 429s use orange `● rate limited (429) … retry in Nm`.
-- `--json`: each provider object carries `cached` (bool), `cache_age_seconds`, and `rate_limited` (bool, present on the error path).
+- `--json`: each provider object carries `cached` (bool), `cache_age_seconds`, and `rate_limited` (bool, present on the error path). Successful OpenAI objects also expose normalized `additional_rate_limits`, `credits`, and `rate_limit_reset_credits`. When OpenAI supplies only `reset_after_seconds`, subtract both cache age and time since snapshot load before reporting the remaining countdown.
 
 Overrides:
 - `LLM_USAGE_CACHE_TTL=<seconds>` — success window; when set, takes manual control and applies to **both** providers as-is (overriding the per-provider defaults of 600s OpenAI / 1200s Anthropic). `0` (or ≤0) disables **all** caching (success *and* negative).
@@ -55,6 +58,7 @@ Writes are atomic (`os.replace` of a pid-suffixed temp file) and entirely best-e
 ## Hard constraints
 
 - **Stdlib only.** No third-party imports, ever. The provider SDKs do not expose these usage endpoints; the script calls them directly with `urllib`, mimicking each vendor CLI's headers (see `fetch_anthropic` / `fetch_codex` — the `User-Agent`, `anthropic-beta`, `Originator`, and `Chatgpt-Account-Id` headers are required by the endpoints, not decoration).
+- **Runtime remains one executable.** Tests and sanitized fixtures may live under `tests/`, but `llm-usage` must remain independently copyable/symlinkable and must not import project-local support code.
 - **Python 3.8+ compatible.** `from __future__ import annotations` makes the `X | None` annotations safe on older runtimes; don't introduce syntax newer than walrus operators.
 
 ## Architecture
@@ -63,7 +67,7 @@ Top-to-bottom pipeline, one section per provider, each failing independently:
 
 1. **Token loaders** (`load_anthropic_token`, `load_codex_token`) — chain of sources: env var → macOS Keychain (`security find-generic-password`, Anthropic only) → credential file (`~/.claude/.credentials.json` / `~/.codex/auth.json`). Codex token expiry comes from locally decoding the access token's JWT `exp` claim (`jwt_claims` — unverified by design, inspection only). OAuth expiry warnings render only when the token is expired or has 4 hours or less remaining.
 2. **Fetchers** (`fetch_anthropic`, `fetch_codex`) — GET the undocumented usage endpoints (`api.anthropic.com/api/oauth/usage`, `chatgpt.com/backend-api/wham/usage`) via `http_get_json`, which never raises: it returns `(status_or_None, body)`.
-3. **Snapshots + sections** (`anthropic_snapshot` / `openai_snapshot`, then `render_anthropic_section` / `render_openai_section`) — each provider fetch/load happens once per data refresh, then renders independently and degrades any failure (no token, 401, API error) to an inline `warn_line` so the other section still renders. The two providers' response shapes differ: Anthropic returns named bands (`five_hour`, `seven_day`, `seven_day_opus`, …) with `utilization` + `resets_at` ISO timestamps; OpenAI returns `rate_limit.{primary,secondary}_window` with `used_percent` + window/reset seconds.
+3. **Snapshots + sections** (`anthropic_snapshot` / `openai_snapshot`, then `render_anthropic_section` / `render_openai_section`) — each provider fetch/load happens once per data refresh, then renders independently and degrades any failure (no token, 401, API error) to an inline `warn_line` so the other section still renders. The two providers' response shapes differ: Anthropic returns named bands (`five_hour`, `seven_day`, `seven_day_opus`, …) with `utilization` + `resets_at` ISO timestamps; OpenAI returns shared `rate_limit.{primary,secondary}_window` data, optional named `additional_rate_limits[]`, purchased-credit status, and an aggregate usage-limit reset count. Keep reset redemption and per-credit detail in Codex; this dashboard is read-only and the direct usage endpoint does not guarantee the detailed app-server rows.
 4. **Row renderer** (`row`) — the core visual idea: each band is a 2-line block where line 0 places the elapsed-window percentage plus `▼` at the percent-of-window-elapsed position above a usage bar (line 1), so bar-end vs. `▼` position *is* the over/under-pace signal. The pace verdict and reset countdown sit to the right of the marker when they fit, or just before the marker when the right side is tight, without moving the marker column; adjacent auxiliary segments are separated with a bullet, and the marker is padded from the surrounding labels. Provider sections compute a compact shared label/usage-percent layout from the visible rows, so all bars in that section align to the longest visible label with a small gap. Pace verdict (±5pp threshold) colors the elapsed label, marker, and pace label together.
 
 The render path now uses provider snapshots: data fetch/load happens once, then

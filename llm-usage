@@ -12,6 +12,10 @@ to match the over/under/on-pace verdict:
     bar ends before the ▼ → under-pace (green ▼), headroom available
     bar ends under the ▼  → on-pace (white ▼)
 
+OpenAI purchased-credit status, usage-limit reset count, and named
+model/feature-specific limit groups are shown when the usage response includes
+them. This dashboard is read-only; reset redemption remains in Codex.
+
 Tokens are loaded in this order:
 
   Anthropic OAuth:
@@ -543,7 +547,7 @@ def row(label: str, usage_pct: float, now_pct: float | None,
     label_col_w = label_w + label_gap_w
     pct_text = f"{usage_pct:.0f}%"
     pct_col_w = max(pct_w if pct_w is not None else 0, len(pct_text))
-    pct_str = f"{pct_text:<{pct_col_w}}"
+    pct_str = f"{pct_text:>{pct_col_w}}"
     bar_gap_w = 1
     overflow_w = 2
     min_bar = 4 if width < 46 else 8
@@ -875,7 +879,110 @@ def adjusted_openai_reset_seconds(snapshot: dict, window: dict
     rem_s = window.get("reset_after_seconds")
     if rem_s is None:
         return None
-    return max(0.0, float(rem_s) - snapshot_elapsed(snapshot))
+    cache_age = float(snapshot.get("age") or 0.0)
+    return max(0.0, float(rem_s) - cache_age - snapshot_elapsed(snapshot))
+
+
+def openai_window_rows(snapshot: dict, rate_limit: dict
+                       ) -> list[tuple[str, float, float | None,
+                                       datetime | None, float | None]]:
+    """Normalize an OpenAI rate-limit object into dashboard rows."""
+    rows = []
+    for key, default_label in [
+        ("secondary_window", "secondary"),
+        ("primary_window", "primary"),
+    ]:
+        window = rate_limit.get(key)
+        if not window:
+            continue
+        usage = float(window.get("used_percent", 0))
+        window_s = window.get("limit_window_seconds")
+        remaining_s = adjusted_openai_reset_seconds(snapshot, window)
+        if window_s and remaining_s is not None:
+            now_pct = max(0.0, min(
+                100.0,
+                (window_s - remaining_s) / window_s * 100,
+            ))
+        else:
+            now_pct = None
+        reset_at = window.get("reset_at")
+        reset_dt = (datetime.fromtimestamp(reset_at, tz=timezone.utc)
+                    if reset_at else None)
+        label = fmt_window(window_s) if window_s else default_label
+        if key == "secondary_window":
+            label = f"{label} (weekly)"
+        rows.append((label, usage, now_pct, reset_dt, remaining_s))
+    return rows
+
+
+def openai_reset_credit_count(body: dict) -> int:
+    """Available reset-credit count from the usage endpoint.
+
+    Newer Codex app-server RPCs can also return per-credit detail rows, but the
+    direct /wham/usage endpoint used here guarantees only the aggregate count.
+    Accept a detail list when present so cached/newer shapes remain compatible.
+    """
+    reset_credits = body.get("rate_limit_reset_credits") or {}
+    count = reset_credits.get("available_count")
+    if isinstance(count, (int, float)) and not isinstance(count, bool):
+        return max(0, int(count))
+    credits = reset_credits.get("credits")
+    if isinstance(credits, list):
+        return sum(
+            1 for credit in credits
+            if not isinstance(credit, dict)
+            or credit.get("status") in (None, "available")
+        )
+    return 0
+
+
+def openai_credit_status_line(body: dict) -> str | None:
+    """Compact, read-only status for purchased and usage-reset credits."""
+    parts = []
+    credits = body.get("credits") or {}
+    if credits.get("unlimited"):
+        parts.append(f"{fg256(78)}credits unlimited{RESET}")
+    elif credits.get("overage_limit_reached"):
+        parts.append(f"{fg256(203)}credit limit reached{RESET}")
+    elif credits.get("has_credits"):
+        balance = credits.get("balance")
+        text = (f"credit balance {balance}"
+                if balance not in (None, "") else "credits available")
+        parts.append(f"{fg256(78)}{text}{RESET}")
+
+    reset_count = openai_reset_credit_count(body)
+    if reset_count:
+        noun = "reset" if reset_count == 1 else "resets"
+        parts.append(f"{fg256(78)}{reset_count} usage {noun}{RESET}")
+    if not parts:
+        return None
+    return f"  {DIM}Extras:{RESET} " + (SUB_FG + " · " + RESET).join(parts)
+
+
+def openai_additional_rate_limits(body: dict
+                                  ) -> list[tuple[str, dict, str | None]]:
+    """Return named model/feature-specific rate-limit groups."""
+    groups = []
+    for item in body.get("additional_rate_limits") or []:
+        if not isinstance(item, dict):
+            continue
+        rate_limit = item.get("rate_limit")
+        if not isinstance(rate_limit, dict):
+            continue
+        feature = item.get("metered_feature")
+        title = item.get("limit_name") or feature or "Additional limit"
+        groups.append((str(title), rate_limit,
+                       str(feature) if feature is not None else None))
+    return groups
+
+
+def openai_limit_heading(title: str, rate_limit: dict) -> str:
+    status = ""
+    if rate_limit.get("limit_reached"):
+        status = f"  {fg256(203)}● limit reached{RESET}"
+    elif not rate_limit.get("allowed", True):
+        status = f"  {fg256(214)}⚠ not currently allowed{RESET}"
+    return f"  {DIM}{title}{RESET}{status}"
 
 
 def render_openai_section(snapshot: dict, width: int) -> tuple[list[str], bool]:
@@ -916,6 +1023,10 @@ def render_openai_section(snapshot: dict, width: int) -> tuple[list[str], bool]:
         lines.append(warn_line(f"API error {code}: {json.dumps(body)[:200]}"))
         return [clip_ansi(line, width) for line in lines], False
 
+    credit_line = openai_credit_status_line(body)
+    if credit_line:
+        lines.append(credit_line)
+
     rl = body.get("rate_limit") or {}
     if rl.get("limit_reached"):
         lines.append(f"  {fg256(203)}● limit reached — requests will be rejected"
@@ -924,29 +1035,16 @@ def render_openai_section(snapshot: dict, width: int) -> tuple[list[str], bool]:
         lines.append(f"  {fg256(214)}⚠ requests not currently allowed{RESET}")
 
     # Weekly (secondary) window first — it's the limit that matters most.
-    window_rows = []
-    for key, default_label in [
-        ("secondary_window", "secondary"),
-        ("primary_window", "primary"),
-    ]:
-        w = rl.get(key)
-        if not w:
-            continue
-        usage = float(w.get("used_percent", 0))
-        wnd_s = w.get("limit_window_seconds")
-        rem_s = adjusted_openai_reset_seconds(snapshot, w)
-        if wnd_s and rem_s is not None:
-            now_pct = max(0.0, min(100.0,
-                                   (wnd_s - rem_s) / wnd_s * 100))
-        else:
-            now_pct = None
-        reset_at = w.get("reset_at")
-        reset_dt = (datetime.fromtimestamp(reset_at, tz=timezone.utc)
-                    if reset_at else None)
-        label = fmt_window(wnd_s) if wnd_s else default_label
-        if key == "secondary_window":
-            label = f"{label} (weekly)"
-        window_rows.append((label, usage, now_pct, reset_dt, rem_s))
+    base_rows = openai_window_rows(snapshot, rl)
+    additional_groups = [
+        (title, rate_limit, openai_window_rows(snapshot, rate_limit))
+        for title, rate_limit, _feature in openai_additional_rate_limits(body)
+    ]
+    window_rows = base_rows + [
+        window_row
+        for _title, _rate_limit, group_rows in additional_groups
+        for window_row in group_rows
+    ]
 
     label_w, pct_w = row_layout_widths(
         [label for label, _usage, _now_pct, _reset_dt, _rem_s in window_rows],
@@ -954,10 +1052,18 @@ def render_openai_section(snapshot: dict, width: int) -> tuple[list[str], bool]:
         width,
     )
     printed = 0
-    for label, usage, now_pct, reset_dt, rem_s in window_rows:
+    for label, usage, now_pct, reset_dt, rem_s in base_rows:
         lines.extend(row(label, usage, now_pct, reset_dt, rem_s, width,
                          label_w, pct_w).splitlines())
         printed += 1
+    for title, rate_limit, group_rows in additional_groups:
+        if not group_rows:
+            continue
+        lines.append(openai_limit_heading(title, rate_limit))
+        for label, usage, now_pct, reset_dt, rem_s in group_rows:
+            lines.extend(row(label, usage, now_pct, reset_dt, rem_s, width,
+                             label_w, pct_w).splitlines())
+            printed += 1
     if not printed:
         lines.append(f"  {DIM}(no usage data){RESET}")
     return [clip_ansi(line, width) for line in lines], True
@@ -968,7 +1074,8 @@ def render_openai_section(snapshot: dict, width: int) -> tuple[list[str], bool]:
 # `--json` emits a machine-readable snapshot for schedulers (e.g. bin/checkpoint)
 # that route work to whichever subscription has the most headroom. Both providers
 # are normalized to a uniform shape: each relevant window reports `utilization`
-# as a percent (0-100) plus seconds-until-reset. The TUI path is untouched.
+# as a percent (0-100) plus seconds-until-reset. OpenAI also includes its
+# model/feature-specific limits, purchased-credit status, and reset count.
 
 def _anthropic_json() -> dict:
     tok = load_anthropic_token()
@@ -1010,6 +1117,7 @@ def _anthropic_json() -> dict:
 
 
 def _openai_json() -> dict:
+    loaded_at = time.time()
     tok = load_codex_token()
     if not tok or not tok.get("access_token"):
         return {"ok": False, "error": "no OAuth token", "windows": {},
@@ -1021,6 +1129,7 @@ def _openai_json() -> dict:
                 "rate_limited": code == 429,
                 "cached": age is not None, "cache_age_seconds": age}
     rl = o.get("rate_limit") or {}
+    snapshot = {"loaded_at": loaded_at, "age": age}
     windows: dict[str, Any] = {}
     for key in ("secondary_window", "primary_window"):
         w = rl.get(key)
@@ -1028,13 +1137,44 @@ def _openai_json() -> dict:
             continue
         windows[key] = {
             "utilization": float(w.get("used_percent", 0)),
-            "reset_seconds": w.get("reset_after_seconds"),
+            "reset_seconds": adjusted_openai_reset_seconds(snapshot, w),
             "reset_at": w.get("reset_at"),
         }
+    additional = []
+    for title, rate_limit, feature in openai_additional_rate_limits(o):
+        extra_windows: dict[str, Any] = {}
+        for key in ("secondary_window", "primary_window"):
+            w = rate_limit.get(key)
+            if not w:
+                continue
+            extra_windows[key] = {
+                "utilization": float(w.get("used_percent", 0)),
+                "reset_seconds": adjusted_openai_reset_seconds(snapshot, w),
+                "reset_at": w.get("reset_at"),
+            }
+        additional.append({
+            "name": title,
+            "metered_feature": feature,
+            "allowed": bool(rate_limit.get("allowed", True)),
+            "limit_reached": bool(rate_limit.get("limit_reached")),
+            "windows": extra_windows,
+        })
+    credits = o.get("credits") or {}
     return {"ok": True, "error": None,
             "plan": o.get("plan_type"),
             "limit_reached": bool(rl.get("limit_reached")),
             "windows": windows,
+            "additional_rate_limits": additional,
+            "credits": {
+                "has_credits": bool(credits.get("has_credits")),
+                "unlimited": bool(credits.get("unlimited")),
+                "balance": credits.get("balance"),
+                "overage_limit_reached": bool(
+                    credits.get("overage_limit_reached")),
+            },
+            "rate_limit_reset_credits": {
+                "available_count": openai_reset_credit_count(o),
+            },
             "cached": age is not None, "cache_age_seconds": age}
 
 

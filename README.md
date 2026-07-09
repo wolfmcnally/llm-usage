@@ -1,6 +1,6 @@
 # llm-usage
 
-A terminal dashboard for your **Anthropic (Claude)** and **OpenAI (ChatGPT/Codex)** subscription rate limits — the same numbers Claude Code's `/usage` command and the Codex CLI report, side by side, sized to your terminal.
+A terminal dashboard for your **Anthropic (Claude)** and **OpenAI (ChatGPT/Codex)** subscription rate limits — the same numbers Claude Code's `/usage` command and the Codex CLI report, side by side, sized to your terminal. OpenAI purchased-credit status, usage-limit resets, and model-specific limit groups are included when the usage endpoint reports them.
 
 ```text
 ANTHROPIC  Claude Max Plan  [⚠ OAuth expires in 3h 19m]      Wed Jun 03 13:51 MDT
@@ -41,6 +41,21 @@ OAuth token expiry is shown only when a provider token is expired or has 4 hours
 or less remaining, with a red warning inside 1 hour. Expiry and cache notices
 appear inline on the provider title line.
 
+The OpenAI section adds an `Extras:` line when purchased credits, unlimited
+credits, a credit-limit failure, or usage-limit resets are available. Named
+model/feature-specific limits appear as their own groups beneath the shared
+Codex windows. The dashboard is read-only: redeem resets in Codex itself.
+
+## Model choice and OpenAI usage
+
+OpenAI normalizes the different costs of Sol, Terra, Luna, reasoning effort,
+tool use, and task complexity into the percentages returned by its usage
+service. The dashboard therefore treats those percentages as authoritative
+instead of estimating messages remaining from published ranges. `max` can use
+more reasoning, and `ultra` coordinates multiple agents, so either can change
+your burn rate substantially even when the underlying limit windows stay the
+same.
+
 ## Installation
 
 Copy (or symlink) the script anywhere on your `PATH`:
@@ -50,6 +65,12 @@ ln -s "$PWD/llm-usage" ~/bin/llm-usage
 ```
 
 Requirements: **Python 3.8+**, nothing else — no third-party packages.
+
+Run the stdlib-only fixture tests from the repository root:
+
+```sh
+python3 -m unittest discover -s tests -v
+```
 
 ## Interactive TUI
 
@@ -69,6 +90,14 @@ ages stay current without extra API calls.
 `--tui` and `--json` are mutually exclusive; combining them exits with code `2`.
 `--fresh` works with `--tui` as an initial cache-read bypass only, then the TUI
 returns to normal cache-aware refresh behavior.
+
+## JSON output
+
+`llm-usage --json` emits normalized provider windows for scripts and schedulers.
+The OpenAI object also includes `additional_rate_limits`, `credits`, and
+`rate_limit_reset_credits`. Relative reset countdowns are reduced by the age of
+the cached response; `reset_at`, when provided, remains the authoritative
+absolute timestamp.
 
 ## Authentication
 
@@ -96,7 +125,7 @@ The undocumented usage endpoints are rate-limited, so `llm-usage` calls each pro
 - **Bypass for one run:** `llm-usage --fresh` (alias `--no-cache`, or `LLM_USAGE_NO_CACHE=1`) hits the APIs live and refreshes the cache — including overriding an active 429 backoff.
 - **Other failures aren't cached** — a 401/network error retries on your next run rather than sticking around.
 - **Location:** `$XDG_CACHE_HOME/llm-usage/` (default `~/.cache/llm-usage/`).
-- The `--json` output includes `cached`, `cache_age_seconds`, and `rate_limited` per provider.
+- The `--json` output includes `cached`, `cache_age_seconds`, and `rate_limited` per provider, plus OpenAI credits, reset-credit count, and additional named limits on successful OpenAI responses.
 
 ## Failure behavior
 
