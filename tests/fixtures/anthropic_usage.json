@@ -1,0 +1,82 @@
+{
+  "five_hour": {
+    "utilization": 99,
+    "resets_at": "2030-01-01T05:00:00+00:00"
+  },
+  "seven_day": {
+    "utilization": 99,
+    "resets_at": "2030-01-07T00:00:00+00:00"
+  },
+  "limits": [
+    {
+      "kind": "session",
+      "group": "session",
+      "is_active": true,
+      "severity": "normal",
+      "percent": 25,
+      "resets_at": "2030-01-01T05:00:00+00:00",
+      "scope": null
+    },
+    {
+      "kind": "weekly_all",
+      "group": "weekly",
+      "is_active": false,
+      "severity": "normal",
+      "percent": 40,
+      "resets_at": "2030-01-07T00:00:00+00:00",
+      "scope": null
+    },
+    {
+      "kind": "weekly_scoped",
+      "group": "weekly",
+      "is_active": true,
+      "severity": "warning",
+      "percent": 50,
+      "resets_at": "2030-01-07T00:00:00+00:00",
+      "scope": {
+        "model": {
+          "id": "fixture-fable",
+          "display_name": "Fable"
+        },
+        "surface": null
+      }
+    }
+  ],
+  "spend": {
+    "used": {
+      "amount_minor": 1234,
+      "currency": "USD",
+      "exponent": 2
+    },
+    "limit": {
+      "amount_minor": 5000,
+      "currency": "USD",
+      "exponent": 2
+    },
+    "percent": 24.68,
+    "severity": "normal",
+    "enabled": true,
+    "disabled_reason": null,
+    "cap": {
+      "money": null,
+      "credits": {
+        "amount_minor": 5000,
+        "exponent": 2
+      }
+    },
+    "balance": null,
+    "auto_reload": null,
+    "disclaimer": "Fixture usage-credit notice",
+    "can_purchase_credits": true,
+    "can_toggle": true
+  },
+  "extra_usage": {
+    "is_enabled": false,
+    "monthly_limit": 100,
+    "used_credits": 100,
+    "utilization": 100,
+    "currency": "USD",
+    "decimal_places": 2,
+    "disabled_reason": "legacy_fixture"
+  }
+}

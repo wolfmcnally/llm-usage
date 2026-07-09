@@ -12,9 +12,10 @@ to match the over/under/on-pace verdict:
     bar ends before the ▼ → under-pace (green ▼), headroom available
     bar ends under the ▼  → on-pace (white ▼)
 
-OpenAI purchased-credit status, usage-limit reset count, and named
-model/feature-specific limit groups are shown when the usage response includes
-them. This dashboard is read-only; reset redemption remains in Codex.
+Provider-specific usage-credit/spending status, usage-limit reset count, and
+named model/feature-specific limit groups are shown when the usage responses
+include them. This dashboard is read-only; purchases, toggles, and reset
+redemption remain in the vendor apps.
 
 Tokens are loaded in this order:
 
@@ -742,29 +743,236 @@ def displayed_cache_age(snapshot: dict, include_live_429: bool = False
     return None
 
 
-def scoped_weekly_bands(body: dict) -> list[tuple[str, dict, int]]:
-    """Model/surface-scoped weekly limits from the newer `limits` array.
+def _limit_key_part(value: str) -> str:
+    part = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+    return part or "scoped"
 
-    The API moved per-model weekly bands (the old `seven_day_opus`-style
-    top-level keys, which now come back null) into `limits` entries of kind
-    `weekly_scoped`, whose scope names the model — e.g. what Claude Code's
-    /usage shows as "Current Week (Fable)". Normalize each to the
-    (label, {utilization, resets_at}, window_seconds) shape row() expects.
+
+def anthropic_limit_bands(body: dict) -> list[dict]:
+    """Normalize Anthropic's generic limits, with legacy-key fallbacks.
+
+    Current responses describe session, all-model weekly, and scoped weekly
+    limits in `limits[]`. Older responses expose the same data through named
+    top-level fields. Prefer the generic representation so new models and
+    surfaces do not require hard-coded rollout names, then fill any missing
+    bands from the stable legacy keys.
     """
     bands = []
-    for lim in body.get("limits") or []:
-        if lim.get("kind") != "weekly_scoped":
+    seen = set()
+
+    def add(key: str, label: str, utilization: Any, resets_at: Any,
+            window_seconds: int, kind: str, group: str | None = None,
+            is_active: bool | None = None,
+            severity: str | None = None, source: str = "limits") -> None:
+        if key in seen:
+            return
+        try:
+            usage = float(utilization or 0)
+        except (TypeError, ValueError):
+            usage = 0.0
+        bands.append({
+            "key": key,
+            "label": label,
+            "utilization": usage,
+            "resets_at": resets_at,
+            "window_seconds": window_seconds,
+            "kind": kind,
+            "group": group,
+            "is_active": is_active,
+            "severity": severity,
+            "source": source,
+        })
+        seen.add(key)
+
+    for limit in body.get("limits") or []:
+        if not isinstance(limit, dict):
             continue
-        scope = lim.get("scope") or {}
-        model = (scope.get("model") or {}).get("display_name")
-        what = model or scope.get("surface") or "scoped"
-        bands.append((
-            f"7-day {what}",
-            {"utilization": lim.get("percent", 0),
-             "resets_at": lim.get("resets_at")},
-            7 * 86400,
-        ))
+        kind = limit.get("kind")
+        if kind == "session":
+            key, label, window_seconds = "five_hour", "5-hour", 5 * 3600
+        elif kind == "weekly_all":
+            key, label, window_seconds = (
+                "seven_day", "7-day overall", 7 * 86400)
+        elif kind == "weekly_scoped":
+            scope = limit.get("scope") or {}
+            if not isinstance(scope, dict):
+                scope = {}
+            model_data = scope.get("model") or {}
+            if not isinstance(model_data, dict):
+                model_data = {}
+            model = model_data.get("display_name")
+            what = model or scope.get("surface") or "scoped"
+            key = "seven_day_" + _limit_key_part(str(what))
+            label, window_seconds = f"7-day {what}", 7 * 86400
+        else:
+            continue
+        active = limit.get("is_active")
+        add(
+            key, label, limit.get("percent"), limit.get("resets_at"),
+            window_seconds, str(kind), limit.get("group"),
+            bool(active) if active is not None else None,
+            limit.get("severity"),
+        )
+
+    legacy = [
+        ("seven_day", "7-day overall", "weekly_all", 7 * 86400),
+        ("seven_day_sonnet", "7-day Sonnet", "weekly_scoped", 7 * 86400),
+        ("seven_day_opus", "7-day Opus", "weekly_scoped", 7 * 86400),
+        ("seven_day_oauth_apps", "7-day OAuth apps", "weekly_scoped",
+         7 * 86400),
+        ("seven_day_cowork", "7-day cowork", "weekly_scoped", 7 * 86400),
+        ("five_hour", "5-hour", "session", 5 * 3600),
+    ]
+    for key, label, kind, window_seconds in legacy:
+        data = body.get(key)
+        if not isinstance(data, dict):
+            continue
+        add(
+            key, label, data.get("utilization"), data.get("resets_at"),
+            window_seconds, kind, source="legacy",
+        )
+
+    priority = {"weekly_all": 0, "weekly_scoped": 1, "session": 2}
+    bands.sort(key=lambda band: priority.get(band["kind"], 3))
     return bands
+
+
+def normalize_money(value: Any, default_currency: str | None = None
+                    ) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    amount_minor = value.get("amount_minor")
+    exponent = value.get("exponent", 2)
+    if not isinstance(amount_minor, (int, float)) \
+            or isinstance(amount_minor, bool):
+        return None
+    if not isinstance(exponent, int) or isinstance(exponent, bool):
+        exponent = 2
+    exponent = max(0, min(exponent, 9))
+    currency = value.get("currency") or default_currency
+    return {
+        "amount": float(amount_minor) / (10 ** exponent),
+        "amount_minor": amount_minor,
+        "currency": currency,
+        "exponent": exponent,
+    }
+
+
+def normalize_anthropic_spend(body: dict) -> dict | None:
+    """Normalize current `spend`, falling back to legacy `extra_usage`."""
+    spend = body.get("spend")
+    if isinstance(spend, dict) and spend:
+        limit = normalize_money(spend.get("limit"))
+        currency = limit.get("currency") if limit else None
+        cap = spend.get("cap") or {}
+        if not isinstance(cap, dict):
+            cap = {}
+        cap_value = normalize_money(cap.get("money"), currency)
+        if cap_value is None:
+            cap_value = normalize_money(cap.get("credits"), currency)
+        return {
+            "source": "spend",
+            "enabled": bool(spend.get("enabled")),
+            "used": normalize_money(spend.get("used"), currency),
+            "limit": limit or cap_value,
+            "cap": cap_value,
+            "balance": normalize_money(spend.get("balance"), currency),
+            "percent": (float(spend.get("percent"))
+                        if isinstance(spend.get("percent"), (int, float))
+                        and not isinstance(spend.get("percent"), bool)
+                        else None),
+            "severity": spend.get("severity"),
+            "disabled_reason": spend.get("disabled_reason"),
+            "auto_reload": spend.get("auto_reload"),
+            "can_purchase_credits": bool(spend.get("can_purchase_credits")),
+            "can_toggle": bool(spend.get("can_toggle")),
+            "disclaimer": spend.get("disclaimer"),
+        }
+
+    extra = body.get("extra_usage")
+    if not isinstance(extra, dict):
+        return None
+    exponent = extra.get("decimal_places", 2)
+    if not isinstance(exponent, int) or isinstance(exponent, bool):
+        exponent = 2
+    currency = extra.get("currency")
+
+    def legacy_money(value: Any) -> dict | None:
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return None
+        return normalize_money({
+            "amount_minor": value,
+            "currency": currency,
+            "exponent": exponent,
+        })
+
+    percent = extra.get("utilization")
+    return {
+        "source": "extra_usage",
+        "enabled": bool(extra.get("is_enabled")),
+        "used": legacy_money(extra.get("used_credits")),
+        "limit": legacy_money(extra.get("monthly_limit")),
+        "cap": legacy_money(extra.get("monthly_limit")),
+        "balance": None,
+        "percent": (float(percent)
+                    if isinstance(percent, (int, float))
+                    and not isinstance(percent, bool) else None),
+        "severity": None,
+        "disabled_reason": extra.get("disabled_reason"),
+        "auto_reload": None,
+        "can_purchase_credits": False,
+        "can_toggle": False,
+        "disclaimer": None,
+    }
+
+
+def format_money(value: dict | None) -> str | None:
+    if not value:
+        return None
+    amount = value.get("amount")
+    if not isinstance(amount, (int, float)):
+        return None
+    currency = value.get("currency") or ""
+    symbol = {"USD": "$", "EUR": "€", "GBP": "£"}.get(currency)
+    number = f"{amount:,.{min(int(value.get('exponent', 2)), 4)}f}"
+    return f"{symbol}{number}" if symbol else f"{number} {currency}".strip()
+
+
+def anthropic_spend_status_line(body: dict) -> str | None:
+    spend = normalize_anthropic_spend(body)
+    if not spend:
+        return None
+    parts = []
+    if spend["enabled"]:
+        parts.append(f"{fg256(78)}usage credits on{RESET}")
+    else:
+        parts.append(f"{SUB_FG}usage credits off{RESET}")
+    used = format_money(spend.get("used"))
+    limit = format_money(spend.get("limit"))
+    if used and limit:
+        parts.append(f"{SUB_FG}{used} / {limit}{RESET}")
+    reason = spend.get("disabled_reason")
+    if reason and reason not in ("disabled", "not_enabled"):
+        parts.append(f"{fg256(214)}{str(reason).replace('_', ' ')}{RESET}")
+    severity = spend.get("severity")
+    if severity not in (None, "normal"):
+        parts.append(f"{fg256(214)}{str(severity).replace('_', ' ')}{RESET}")
+    return f"  {DIM}Extras:{RESET} " + (SUB_FG + " · " + RESET).join(parts)
+
+
+def anthropic_limit_status_lines(bands: list[dict]) -> list[str]:
+    lines = []
+    for band in bands:
+        severity = band.get("severity")
+        if severity in (None, "normal"):
+            continue
+        color = fg256(203) if severity in ("critical", "exhausted") \
+            else fg256(214)
+        status = str(severity).replace("_", " ")
+        lines.append(
+            f"  {color}⚠ {band['label']}: {status}{RESET}"
+        )
+    return lines
 
 
 def anthropic_snapshot() -> dict:
@@ -819,35 +1027,30 @@ def render_anthropic_section(snapshot: dict, width: int) -> tuple[list[str], boo
         lines.append(warn_line(f"API error {code}: {json.dumps(body)[:200]}"))
         return [clip_ansi(line, width) for line in lines], False
 
+    spend_line = anthropic_spend_status_line(body)
+    if spend_line:
+        lines.append(spend_line)
+
     now = datetime.now(timezone.utc)
-    bands = [("7-day overall", body.get("seven_day"), 7 * 86400)]
-    bands.extend(scoped_weekly_bands(body))
-    bands.extend([
-        ("7-day Sonnet", body.get("seven_day_sonnet"), 7 * 86400),
-        ("7-day Opus", body.get("seven_day_opus"), 7 * 86400),
-        ("7-day OAuth apps", body.get("seven_day_oauth_apps"), 7 * 86400),
-        ("7-day cowork", body.get("seven_day_cowork"), 7 * 86400),
-        ("5-hour", body.get("five_hour"), 5 * 3600),
-    ])
-    visible_bands = [(label, data, window_s)
-                     for label, data, window_s in bands if data]
+    bands = anthropic_limit_bands(body)
+    lines.extend(anthropic_limit_status_lines(bands))
     label_w, pct_w = row_layout_widths(
-        [label for label, _data, _window_s in visible_bands],
-        [float(data.get("utilization", 0))
-         for _label, data, _window_s in visible_bands],
+        [band["label"] for band in bands],
+        [band["utilization"] for band in bands],
         width,
     )
     printed = 0
-    for label, data, window_s in visible_bands:
-        usage = float(data.get("utilization", 0))
-        reset_dt = parse_iso(data.get("resets_at"))
+    for band in bands:
+        usage = band["utilization"]
+        reset_dt = parse_iso(band.get("resets_at"))
         if reset_dt:
             rem = (reset_dt - now).total_seconds()
+            window_s = band["window_seconds"]
             now_pct = max(0.0, min(100.0, (window_s - rem) / window_s * 100))
         else:
             rem = None
             now_pct = None
-        lines.extend(row(label, usage, now_pct, reset_dt, rem, width,
+        lines.extend(row(band["label"], usage, now_pct, reset_dt, rem, width,
                          label_w, pct_w).splitlines())
         printed += 1
     if not printed:
@@ -1074,8 +1277,8 @@ def render_openai_section(snapshot: dict, width: int) -> tuple[list[str], bool]:
 # `--json` emits a machine-readable snapshot for schedulers (e.g. bin/checkpoint)
 # that route work to whichever subscription has the most headroom. Both providers
 # are normalized to a uniform shape: each relevant window reports `utilization`
-# as a percent (0-100) plus seconds-until-reset. OpenAI also includes its
-# model/feature-specific limits, purchased-credit status, and reset count.
+# as a percent (0-100) plus seconds-until-reset. Each provider also includes
+# its provider-specific additional limits and read-only credit/spend status.
 
 def _anthropic_json() -> dict:
     tok = load_anthropic_token()
@@ -1090,29 +1293,22 @@ def _anthropic_json() -> dict:
                 "cached": age is not None, "cache_age_seconds": age}
     now = datetime.now(timezone.utc)
     windows: dict[str, Any] = {}
-    for key in ("seven_day", "five_hour"):
-        d = a.get(key)
-        if not d:
-            continue
-        reset_dt = parse_iso(d.get("resets_at"))
+    for band in anthropic_limit_bands(a):
+        reset_dt = parse_iso(band.get("resets_at"))
         rem = (reset_dt - now).total_seconds() if reset_dt else None
-        windows[key] = {
-            "utilization": float(d.get("utilization", 0)),
-            "resets_at": d.get("resets_at"),
+        windows[band["key"]] = {
+            "utilization": band["utilization"],
+            "resets_at": band.get("resets_at"),
             "reset_seconds": rem,
-        }
-    for label, d, _wnd in scoped_weekly_bands(a):
-        reset_dt = parse_iso(d.get("resets_at"))
-        rem = (reset_dt - now).total_seconds() if reset_dt else None
-        name = label[len("7-day "):] if label.startswith("7-day ") else label
-        key = "seven_day_" + name.lower().replace(" ", "_")
-        windows[key] = {
-            "utilization": float(d.get("utilization", 0)),
-            "resets_at": d.get("resets_at"),
-            "reset_seconds": rem,
+            "kind": band.get("kind"),
+            "group": band.get("group"),
+            "is_active": band.get("is_active"),
+            "severity": band.get("severity"),
+            "source": band.get("source"),
         }
     return {"ok": True, "error": None,
             "subscription": tok.get("subscription"), "windows": windows,
+            "usage_credits": normalize_anthropic_spend(a),
             "cached": age is not None, "cache_age_seconds": age}
 
 

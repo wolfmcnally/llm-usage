@@ -1,6 +1,6 @@
 # llm-usage
 
-A terminal dashboard for your **Anthropic (Claude)** and **OpenAI (ChatGPT/Codex)** subscription rate limits — the same numbers Claude Code's `/usage` command and the Codex CLI report, side by side, sized to your terminal. OpenAI purchased-credit status, usage-limit resets, and model-specific limit groups are included when the usage endpoint reports them.
+A terminal dashboard for your **Anthropic (Claude)** and **OpenAI (ChatGPT/Codex)** subscription rate limits — the same numbers Claude Code's `/usage` command and the Codex CLI report, side by side, sized to your terminal. Provider-specific usage credits, spending, reset credits, and scoped limit groups are included when the usage endpoints report them.
 
 ```text
 ANTHROPIC  Claude Max Plan  [⚠ OAuth expires in 3h 19m]      Wed Jun 03 13:51 MDT
@@ -41,12 +41,14 @@ OAuth token expiry is shown only when a provider token is expired or has 4 hours
 or less remaining, with a red warning inside 1 hour. Expiry and cache notices
 appear inline on the provider title line.
 
-The OpenAI section adds an `Extras:` line when purchased credits, unlimited
-credits, a credit-limit failure, or usage-limit resets are available. Named
-model/feature-specific limits appear as their own groups beneath the shared
-Codex windows. The dashboard is read-only: redeem resets in Codex itself.
+Each provider can add an `Extras:` line. Anthropic reports whether usage credits
+are enabled, month-to-date spending versus the configured limit, and actionable
+disabled states. OpenAI reports purchased-credit status and available
+usage-limit resets. Named model/feature-specific limits appear alongside the
+shared windows. The dashboard is read-only: manage Anthropic usage credits in
+Claude settings and redeem OpenAI resets in Codex itself.
 
-## Model choice and OpenAI usage
+## Model choice and usage
 
 OpenAI normalizes the different costs of Sol, Terra, Luna, reasoning effort,
 tool use, and task complexity into the percentages returned by its usage
@@ -55,6 +57,12 @@ instead of estimating messages remaining from published ranges. `max` can use
 more reasoning, and `ultra` coordinates multiple agents, so either can change
 your burn rate substantially even when the underlying limit windows stay the
 same.
+
+Anthropic likewise reports normalized utilization for the shared session,
+weekly, and model/surface-scoped limits. Current `limits[]` entries are treated
+as authoritative, with the older named response fields retained as fallbacks.
+Usage-credit spending is separate from included-plan utilization and is shown
+without inventing a reset schedule the endpoint does not provide.
 
 ## Installation
 
@@ -94,10 +102,11 @@ returns to normal cache-aware refresh behavior.
 ## JSON output
 
 `llm-usage --json` emits normalized provider windows for scripts and schedulers.
-The OpenAI object also includes `additional_rate_limits`, `credits`, and
-`rate_limit_reset_credits`. Relative reset countdowns are reduced by the age of
-the cached response; `reset_at`, when provided, remains the authoritative
-absolute timestamp.
+The Anthropic object also includes normalized `usage_credits` and limit metadata
+such as `kind`, `is_active`, and `severity`. The OpenAI object includes
+`additional_rate_limits`, `credits`, and `rate_limit_reset_credits`. Relative
+reset countdowns are reduced by the age of the cached response; `reset_at`,
+when provided, remains the authoritative absolute timestamp.
 
 ## Authentication
 
@@ -125,7 +134,7 @@ The undocumented usage endpoints are rate-limited, so `llm-usage` calls each pro
 - **Bypass for one run:** `llm-usage --fresh` (alias `--no-cache`, or `LLM_USAGE_NO_CACHE=1`) hits the APIs live and refreshes the cache — including overriding an active 429 backoff.
 - **Other failures aren't cached** — a 401/network error retries on your next run rather than sticking around.
 - **Location:** `$XDG_CACHE_HOME/llm-usage/` (default `~/.cache/llm-usage/`).
-- The `--json` output includes `cached`, `cache_age_seconds`, and `rate_limited` per provider, plus OpenAI credits, reset-credit count, and additional named limits on successful OpenAI responses.
+- The `--json` output includes `cached`, `cache_age_seconds`, and `rate_limited` per provider, plus Anthropic usage-credit spending and OpenAI credits/reset counts on successful responses.
 
 ## Failure behavior
 
