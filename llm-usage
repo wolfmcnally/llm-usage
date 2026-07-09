@@ -1179,6 +1179,12 @@ def openai_additional_rate_limits(body: dict
     return groups
 
 
+def is_codex_spark_limit(title: str, feature: str | None) -> bool:
+    """Whether an additional rate-limit group is the Codex Spark quota."""
+    normalized_title = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+    return feature == "codex_bengalfox" or "codex-spark" in normalized_title
+
+
 def openai_limit_heading(title: str, rate_limit: dict) -> str:
     status = ""
     if rate_limit.get("limit_reached"):
@@ -1188,7 +1194,9 @@ def openai_limit_heading(title: str, rate_limit: dict) -> str:
     return f"  {DIM}{title}{RESET}{status}"
 
 
-def render_openai_section(snapshot: dict, width: int) -> tuple[list[str], bool]:
+def render_openai_section(snapshot: dict, width: int,
+                          suppress_codex_spark: bool = False
+                          ) -> tuple[list[str], bool]:
     """Render the OpenAI section. Returns lines plus success state."""
     lines = []
     tok = snapshot.get("token")
@@ -1241,7 +1249,9 @@ def render_openai_section(snapshot: dict, width: int) -> tuple[list[str], bool]:
     base_rows = openai_window_rows(snapshot, rl)
     additional_groups = [
         (title, rate_limit, openai_window_rows(snapshot, rate_limit))
-        for title, rate_limit, _feature in openai_additional_rate_limits(body)
+        for title, rate_limit, feature in openai_additional_rate_limits(body)
+        if not suppress_codex_spark
+        or not is_codex_spark_limit(title, feature)
     ]
     window_rows = base_rows + [
         window_row
@@ -1420,13 +1430,16 @@ def legend_lines() -> list[str]:
 
 
 def render_dashboard_snapshot(snapshot: dict, columns: int,
-                              clamp_width: bool) -> tuple[list[str], int]:
+                              clamp_width: bool,
+                              suppress_codex_spark: bool = False
+                              ) -> tuple[list[str], int]:
     width = display_width(columns, clamp_width)
     lines = []
     a_lines, a_ok = render_anthropic_section(snapshot["anthropic"], width)
     lines.extend(a_lines)
     lines.extend(["", RULE_FG + "═" * width + RESET, ""])
-    o_lines, o_ok = render_openai_section(snapshot["openai"], width)
+    o_lines, o_ok = render_openai_section(
+        snapshot["openai"], width, suppress_codex_spark)
     lines.extend(o_lines)
     lines.append("")
     lines.extend(legend_lines())
@@ -1434,10 +1447,12 @@ def render_dashboard_snapshot(snapshot: dict, columns: int,
     return [clip_ansi(line, width) for line in lines], dashboard_exit_code(a_ok, o_ok)
 
 
-def render_dashboard(columns: int, clamp_width: bool
+def render_dashboard(columns: int, clamp_width: bool,
+                     suppress_codex_spark: bool = False
                      ) -> tuple[dict, list[str], int]:
     snapshot = load_dashboard_snapshot()
-    lines, exit_code = render_dashboard_snapshot(snapshot, columns, clamp_width)
+    lines, exit_code = render_dashboard_snapshot(
+        snapshot, columns, clamp_width, suppress_codex_spark)
     return snapshot, lines, exit_code
 
 
@@ -1599,7 +1614,8 @@ def run_tui(initial_fresh: bool) -> int:
     def _run(stdscr) -> int:
         pairs = setup_curses(curses, stdscr)
         height, width = stdscr.getmaxyx()
-        snapshot, lines, exit_code = render_dashboard(width, clamp_width=False)
+        snapshot, lines, exit_code = render_dashboard(
+            width, clamp_width=False, suppress_codex_spark=True)
         if initial_fresh:
             set_cache_read_bypass(no_cache_env())
         scroll = 0
@@ -1612,7 +1628,7 @@ def run_tui(initial_fresh: bool) -> int:
             if now >= next_data:
                 height, width = stdscr.getmaxyx()
                 snapshot, lines, exit_code = render_dashboard(
-                    width, clamp_width=False)
+                    width, clamp_width=False, suppress_codex_spark=True)
                 next_data = float(snapshot["deadline"])
                 next_repaint = now + TUI_REPAINT_SECONDS
                 scroll = clamp_scroll(scroll, len(lines), height)
@@ -1621,7 +1637,8 @@ def run_tui(initial_fresh: bool) -> int:
             if now >= next_repaint:
                 height, width = stdscr.getmaxyx()
                 lines, exit_code = render_dashboard_snapshot(
-                    snapshot, width, clamp_width=False)
+                    snapshot, width, clamp_width=False,
+                    suppress_codex_spark=True)
                 next_repaint = now + TUI_REPAINT_SECONDS
                 scroll = clamp_scroll(scroll, len(lines), height)
                 draw_tui(curses, stdscr, lines, scroll, pairs)
@@ -1642,7 +1659,8 @@ def run_tui(initial_fresh: bool) -> int:
             redraw = False
             if ch == curses.KEY_RESIZE:
                 lines, exit_code = render_dashboard_snapshot(
-                    snapshot, width, clamp_width=False)
+                    snapshot, width, clamp_width=False,
+                    suppress_codex_spark=True)
                 redraw = True
             elif ch in (curses.KEY_UP, ord("k"), ord("K")):
                 scroll -= 1

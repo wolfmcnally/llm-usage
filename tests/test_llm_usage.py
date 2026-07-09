@@ -31,7 +31,7 @@ class OpenAIUsageTests(unittest.TestCase):
                 snapshot, window)
         self.assertEqual(remaining, 870.0)
 
-    def test_render_includes_credits_and_additional_limit_group(self):
+    def test_render_includes_credits_and_can_suppress_codex_spark(self):
         snapshot = {
             "token": {"access_token": "fixture", "expires_at_ms": None},
             "code": 200,
@@ -48,6 +48,14 @@ class OpenAIUsageTests(unittest.TestCase):
         self.assertIn("GPT-5.3-Codex-Spark", plain)
         self.assertTrue(all(llm_usage.visible_len(line) <= 120
                             for line in lines))
+
+        with mock.patch.object(llm_usage.time, "time", return_value=1010.0):
+            tui_lines, ok = llm_usage.render_openai_section(
+                snapshot, 120, suppress_codex_spark=True)
+        tui_plain = "\n".join(
+            llm_usage.ANSI_RE.sub("", line) for line in tui_lines)
+        self.assertTrue(ok)
+        self.assertNotIn("GPT-5.3-Codex-Spark", tui_plain)
 
     def test_json_normalizes_current_openai_usage_shape(self):
         with mock.patch.object(
