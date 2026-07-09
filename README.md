@@ -41,12 +41,12 @@ OAuth token expiry is shown only when a provider token is expired or has 4 hours
 or less remaining, with a red warning inside 1 hour. Expiry and cache notices
 appear inline on the provider title line.
 
-Each provider can add an `Extras:` line. Anthropic reports whether usage credits
-are enabled, month-to-date spending versus the configured limit, and actionable
-disabled states. OpenAI reports purchased-credit status and available
-usage-limit resets. Named model/feature-specific limits appear alongside the
-shared windows. The dashboard is read-only: manage Anthropic usage credits in
-Claude settings and redeem OpenAI resets in Codex itself.
+Each provider can add an `Extras:` line. Anthropic shows it only when usage
+credits are enabled, have recorded spending, or need attention; ordinary
+disabled states stay hidden. OpenAI reports purchased-credit status and
+available usage-limit resets. Named model/feature-specific limits appear
+alongside the shared windows. The dashboard is read-only: manage Anthropic usage
+credits in Claude settings and redeem OpenAI resets in Codex itself.
 
 ## Model choice and usage
 

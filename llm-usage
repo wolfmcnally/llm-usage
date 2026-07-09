@@ -942,6 +942,17 @@ def anthropic_spend_status_line(body: dict) -> str | None:
     spend = normalize_anthropic_spend(body)
     if not spend:
         return None
+    used_money = spend.get("used") or {}
+    used_amount = used_money.get("amount")
+    has_spend = (isinstance(used_amount, (int, float))
+                 and not isinstance(used_amount, bool)
+                 and used_amount > 0)
+    reason = spend.get("disabled_reason")
+    severity = spend.get("severity")
+    actionable_severity = severity not in (None, "normal")
+    if not (spend["enabled"] or has_spend or actionable_severity):
+        return None
+
     parts = []
     if spend["enabled"]:
         parts.append(f"{fg256(78)}usage credits on{RESET}")
@@ -951,11 +962,9 @@ def anthropic_spend_status_line(body: dict) -> str | None:
     limit = format_money(spend.get("limit"))
     if used and limit:
         parts.append(f"{SUB_FG}{used} / {limit}{RESET}")
-    reason = spend.get("disabled_reason")
     if reason and reason not in ("disabled", "not_enabled"):
         parts.append(f"{fg256(214)}{str(reason).replace('_', ' ')}{RESET}")
-    severity = spend.get("severity")
-    if severity not in (None, "normal"):
+    if actionable_severity:
         parts.append(f"{fg256(214)}{str(severity).replace('_', ' ')}{RESET}")
     return f"  {DIM}Extras:{RESET} " + (SUB_FG + " · " + RESET).join(parts)
 

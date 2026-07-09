@@ -146,6 +146,35 @@ class AnthropicUsageTests(unittest.TestCase):
         self.assertTrue(all(llm_usage.visible_len(line) <= 120
                             for line in lines))
 
+    def test_spend_status_hides_inactive_out_of_credits_state(self):
+        body = {
+            "spend": {
+                "enabled": False,
+                "used": {"amount_minor": 0, "currency": "USD"},
+                "limit": {"amount_minor": 2000, "currency": "USD"},
+                "severity": "normal",
+                "disabled_reason": "out_of_credits",
+                "can_purchase_credits": False,
+                "can_toggle": False,
+            }
+        }
+        self.assertIsNone(llm_usage.anthropic_spend_status_line(body))
+
+    def test_spend_status_keeps_actionable_disabled_state(self):
+        body = {
+            "spend": {
+                "enabled": False,
+                "used": {"amount_minor": 0, "currency": "USD"},
+                "severity": "warning",
+                "disabled_reason": "payment_required",
+            }
+        }
+        line = llm_usage.anthropic_spend_status_line(body)
+        plain = llm_usage.ANSI_RE.sub("", line)
+        self.assertIn("usage credits off", plain)
+        self.assertIn("payment required", plain)
+        self.assertIn("warning", plain)
+
     def test_json_includes_normalized_spend_and_generic_limit_metadata(self):
         with mock.patch.object(
                 llm_usage, "load_anthropic_token",
