@@ -141,3 +141,7 @@ The undocumented usage endpoints are rate-limited, so `llm-usage` calls each pro
 Each provider section renders independently: a missing token, expired credential, network failure, or API error in one section degrades to an inline error line while the other section still renders fully. (The Anthropic usage endpoint occasionally returns a transient 429 — just re-run.)
 
 **Exit codes:** `0` both providers OK · `1` one provider failed · `2` both failed · `130` interrupted · `141` broken pipe (e.g. piped to `head`).
+
+## License
+
+MIT — see [LICENSE](LICENSE).

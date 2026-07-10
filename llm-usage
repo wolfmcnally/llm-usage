@@ -178,7 +178,7 @@ def load_anthropic_token() -> dict | None:
         return {"access_token": t, "expires_at_ms": None,
                 "subscription": None, "org": None}
     user = os.environ.get("USER", "")
-    if user:
+    if user and sys.platform == "darwin":
         try:
             out = subprocess.check_output(
                 ["security", "find-generic-password",
@@ -194,7 +194,7 @@ def load_anthropic_token() -> dict | None:
                 "subscription": c.get("subscriptionType"),
                 "org": d.get("organizationUuid"),
             }
-        except (subprocess.CalledProcessError, json.JSONDecodeError):
+        except (subprocess.CalledProcessError, json.JSONDecodeError, OSError):
             pass
     p = os.path.expanduser("~/.claude/.credentials.json")
     if os.path.exists(p):
