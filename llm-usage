@@ -56,7 +56,9 @@ bypass for a single run with --fresh / --no-cache. Cache lives under
 $XDG_CACHE_HOME/llm-usage (default ~/.cache/llm-usage).
 
 No third-party dependencies — stdlib only. The provider SDKs do not expose
-these endpoints; both vendor CLIs hit them directly, and so do we.
+these usage endpoints; both vendor CLIs hit them directly, and so do we.
+OpenAI reset-credit expiration details are optionally enriched through the
+documented local Codex app-server interface.
 """
 
 from __future__ import annotations
@@ -65,10 +67,12 @@ import base64
 import json
 import locale
 import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -216,7 +220,8 @@ def load_anthropic_token() -> dict | None:
 def load_codex_token() -> dict | None:
     tok: dict | None = None
     if t := os.environ.get("CODEX_OAUTH_TOKEN"):
-        tok = {"access_token": t, "account_id": None}
+        tok = {"access_token": t, "account_id": None,
+               "source": "environment"}
     else:
         p = os.path.expanduser("~/.codex/auth.json")
         if os.path.exists(p):
@@ -230,6 +235,7 @@ def load_codex_token() -> dict | None:
                 "access_token": toks.get("access_token"),
                 "account_id": toks.get("account_id"),
                 "auth_mode": d.get("auth_mode"),
+                "source": "auth_file",
             }
     if tok:
         # Codex access tokens are JWTs; the exp claim is the OAuth expiry.
@@ -278,8 +284,127 @@ def fetch_codex(tok: dict) -> tuple[int | None, Any]:
     }
     if tok.get("account_id"):
         headers["Chatgpt-Account-Id"] = tok["account_id"]
-    return http_get_json(
+    code, body = http_get_json(
         "https://chatgpt.com/backend-api/wham/usage", headers)
+    if (code == 200 and isinstance(body, dict)
+            and tok.get("source") == "auth_file"
+            and openai_reset_credit_count(body) > 0):
+        details = fetch_codex_reset_credit_details()
+        if details is not None:
+            body = dict(body)
+            body["rate_limit_reset_credits"] = details
+    return code, body
+
+
+def fetch_codex_reset_credit_details(timeout: float = 5.0
+                                     ) -> dict | None:
+    """Fetch optional per-credit expirations from a local Codex app-server."""
+    codex = shutil.which("codex")
+    if not codex:
+        return None
+
+    proc: subprocess.Popen | None = None
+    lines: queue.Queue[str | None] = queue.Queue()
+    request_id = "llm-usage-rate-limits"
+    try:
+        proc = subprocess.Popen(
+            [codex, "app-server", "--stdio"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+        assert proc.stdin is not None
+        assert proc.stdout is not None
+
+        def read_stdout() -> None:
+            try:
+                for line in proc.stdout:
+                    lines.put(line)
+            finally:
+                lines.put(None)
+
+        threading.Thread(target=read_stdout, daemon=True).start()
+        messages = [
+            {
+                "method": "initialize",
+                "id": "llm-usage-initialize",
+                "params": {
+                    "clientInfo": {
+                        "name": "llm-usage",
+                        "title": "llm-usage",
+                        "version": "1",
+                    }
+                },
+            },
+            {"method": "initialized", "params": {}},
+            {"method": "account/rateLimits/read", "id": request_id},
+        ]
+        for message in messages:
+            proc.stdin.write(json.dumps(message) + "\n")
+        proc.stdin.flush()
+
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                line = lines.get(timeout=remaining)
+            except queue.Empty:
+                return None
+            if line is None:
+                return None
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if message.get("id") != request_id:
+                continue
+            raw = (message.get("result") or {}).get(
+                "rateLimitResetCredits")
+            return normalize_codex_reset_credits(raw)
+    except (OSError, BrokenPipeError, TypeError, ValueError):
+        return None
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+
+def normalize_codex_reset_credits(raw: Any) -> dict | None:
+    """Convert app-server camelCase reset-credit details to cache JSON."""
+    if not isinstance(raw, dict):
+        return None
+    count = raw.get("availableCount")
+    if not isinstance(count, (int, float)) or isinstance(count, bool):
+        return None
+    normalized: dict[str, Any] = {"available_count": max(0, int(count))}
+    credits = raw.get("credits")
+    if credits is None:
+        normalized["credits"] = None
+        return normalized
+    if not isinstance(credits, list):
+        return None
+    normalized["credits"] = [
+        {
+            "id": credit.get("id"),
+            "reset_type": credit.get("resetType"),
+            "status": credit.get("status"),
+            "granted_at": credit.get("grantedAt"),
+            "expires_at": credit.get("expiresAt"),
+            "title": credit.get("title"),
+            "description": credit.get("description"),
+        }
+        for credit in credits
+        if isinstance(credit, dict)
+    ]
+    return normalized
 
 
 # --------------------------------------------------------------- cache ----
@@ -394,9 +519,15 @@ def cache_read(provider: str) -> tuple[int | None, Any, float] | None:
     ttl = rate_limit_ttl() if code == 429 else cache_ttl(provider)
     if ttl <= 0:
         return None
-    age = time.time() - ts
+    now = time.time()
+    age = now - ts
     if age < 0 or age > ttl:
         return None
+    if provider == "openai" and code == 200:
+        expiry = openai_next_reset_credit_expiry(
+            d.get("body") or {}, require_future=False)
+        if expiry is not None and now >= expiry:
+            return None
     return code, d.get("body"), age
 
 
@@ -969,21 +1100,6 @@ def anthropic_spend_status_line(body: dict) -> str | None:
     return f"  {DIM}Extras:{RESET} " + (SUB_FG + " · " + RESET).join(parts)
 
 
-def anthropic_limit_status_lines(bands: list[dict]) -> list[str]:
-    lines = []
-    for band in bands:
-        severity = band.get("severity")
-        if severity in (None, "normal"):
-            continue
-        color = fg256(203) if severity in ("critical", "exhausted") \
-            else fg256(214)
-        status = str(severity).replace("_", " ")
-        lines.append(
-            f"  {color}⚠ {band['label']}: {status}{RESET}"
-        )
-    return lines
-
-
 def anthropic_snapshot() -> dict:
     loaded_at = time.time()
     tok = load_anthropic_token()
@@ -1042,7 +1158,6 @@ def render_anthropic_section(snapshot: dict, width: int) -> tuple[list[str], boo
 
     now = datetime.now(timezone.utc)
     bands = anthropic_limit_bands(body)
-    lines.extend(anthropic_limit_status_lines(bands))
     label_w, pct_w = row_layout_widths(
         [band["label"] for band in bands],
         [band["utilization"] for band in bands],
@@ -1076,10 +1191,14 @@ def openai_snapshot() -> dict:
                 "deadline": loaded_at + DEFAULT_TUI_RETRY_SECONDS}
 
     code, body, age = cached_fetch("openai", fetch_codex, tok)
+    deadline = next_data_refresh_deadline(code, age, loaded_at, "openai")
+    if code == 200 and isinstance(body, dict):
+        expiry = openai_next_reset_credit_expiry(body)
+        if expiry is not None:
+            deadline = min(deadline, expiry)
     return {"provider": "openai", "token": tok, "code": code,
             "body": body, "age": age, "loaded_at": loaded_at,
-            "deadline": next_data_refresh_deadline(code, age, loaded_at,
-                                                   "openai")}
+            "deadline": deadline}
 
 
 def adjusted_openai_reset_seconds(snapshot: dict, window: dict
@@ -1148,6 +1267,48 @@ def openai_reset_credit_count(body: dict) -> int:
     return 0
 
 
+def openai_reset_credit_details_complete(body: dict) -> bool:
+    """Whether detail rows cover every available reset credit."""
+    reset_credits = body.get("rate_limit_reset_credits") or {}
+    credits = reset_credits.get("credits")
+    if not isinstance(credits, list):
+        return False
+    available = [
+        credit for credit in credits
+        if isinstance(credit, dict)
+        and credit.get("status") in (None, "available")
+    ]
+    return len(available) == openai_reset_credit_count(body)
+
+
+def openai_next_reset_credit_expiry(
+        body: dict, require_future: bool = True) -> float | None:
+    """Return the earliest expiry only when all available rows are complete."""
+    if not openai_reset_credit_details_complete(body):
+        return None
+    reset_credits = body.get("rate_limit_reset_credits") or {}
+    available = [
+        credit for credit in reset_credits.get("credits") or []
+        if isinstance(credit, dict)
+        and credit.get("status") in (None, "available")
+    ]
+    if not available:
+        return None
+    expiries = [credit.get("expires_at") for credit in available]
+    if any(not isinstance(value, (int, float)) or isinstance(value, bool)
+           for value in expiries):
+        return None
+    expiry = float(min(expiries))
+    if require_future and expiry <= time.time():
+        return None
+    return expiry
+
+
+def fmt_reset_credit_expiry(expires_at: float) -> str:
+    dt = datetime.fromtimestamp(expires_at, tz=timezone.utc).astimezone()
+    return dt.strftime("%a %b %d %H:%M %Z")
+
+
 def openai_credit_status_line(body: dict) -> str | None:
     """Compact, read-only status for purchased and usage-reset credits."""
     parts = []
@@ -1165,7 +1326,29 @@ def openai_credit_status_line(body: dict) -> str | None:
     reset_count = openai_reset_credit_count(body)
     if reset_count:
         noun = "reset" if reset_count == 1 else "resets"
-        parts.append(f"{fg256(78)}{reset_count} usage {noun}{RESET}")
+        reset_text = f"{fg256(78)}{reset_count} usage {noun}{RESET}"
+        next_expiry = openai_next_reset_credit_expiry(body)
+        if next_expiry is not None:
+            remaining = next_expiry - time.time()
+            if remaining <= 4 * 3600:
+                expiry_color = fg256(203)
+            elif remaining <= 24 * 3600:
+                expiry_color = fg256(214)
+            elif remaining <= 3 * 86400:
+                expiry_color = fg256(186)
+            else:
+                expiry_color = SUB_FG
+            if remaining <= 3 * 86400:
+                when = (
+                    f"in {fmt_relative(remaining)} "
+                    f"({fmt_reset_credit_expiry(next_expiry)})"
+                )
+            else:
+                when = fmt_reset_credit_expiry(next_expiry)
+            reset_text += (
+                f"{SUB_FG}, {RESET}{expiry_color}next expires {when}{RESET}"
+            )
+        parts.append(reset_text)
     if not parts:
         return None
     return f"  {DIM}Extras:{RESET} " + (SUB_FG + " · " + RESET).join(parts)
@@ -1375,6 +1558,16 @@ def _openai_json() -> dict:
             "windows": extra_windows,
         })
     credits = o.get("credits") or {}
+    next_credit_expiry = openai_next_reset_credit_expiry(o)
+    reset_credit_json: dict[str, Any] = {
+        "available_count": openai_reset_credit_count(o),
+        "details_complete": openai_reset_credit_details_complete(o),
+        "next_expires_at": next_credit_expiry,
+        "next_expires_in_seconds": (
+            max(0.0, next_credit_expiry - time.time())
+            if next_credit_expiry is not None else None
+        ),
+    }
     return {"ok": True, "error": None,
             "plan": o.get("plan_type"),
             "limit_reached": bool(rl.get("limit_reached")),
@@ -1387,9 +1580,7 @@ def _openai_json() -> dict:
                 "overage_limit_reached": bool(
                     credits.get("overage_limit_reached")),
             },
-            "rate_limit_reset_credits": {
-                "available_count": openai_reset_credit_count(o),
-            },
+            "rate_limit_reset_credits": reset_credit_json,
             "cached": age is not None, "cache_age_seconds": age}
 
 

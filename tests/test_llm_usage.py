@@ -45,6 +45,7 @@ class OpenAIUsageTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("credit balance 42.5", plain)
         self.assertIn("2 usage resets", plain)
+        self.assertIn("next expires", plain)
         self.assertIn("GPT-5.3-Codex-Spark", plain)
         self.assertTrue(all(llm_usage.visible_len(line) <= 120
                             for line in lines))
@@ -74,6 +75,12 @@ class OpenAIUsageTests(unittest.TestCase):
         self.assertEqual(result["credits"]["balance"], "42.5")
         self.assertEqual(
             result["rate_limit_reset_credits"]["available_count"], 2)
+        self.assertTrue(
+            result["rate_limit_reset_credits"]["details_complete"])
+        self.assertEqual(
+            result["rate_limit_reset_credits"]["next_expires_at"],
+            1893456000.0,
+        )
         self.assertEqual(len(result["additional_rate_limits"]), 1)
         extra = result["additional_rate_limits"][0]
         self.assertEqual(extra["name"], "GPT-5.3-Codex-Spark")
@@ -92,6 +99,138 @@ class OpenAIUsageTests(unittest.TestCase):
             }
         }
         self.assertEqual(llm_usage.openai_reset_credit_count(body), 2)
+
+    def test_near_reset_expiry_is_relative_and_urgency_colored(self):
+        body = {
+            "rate_limit_reset_credits": {
+                "available_count": 1,
+                "credits": [
+                    {"status": "available", "expires_at": 8200},
+                ],
+            }
+        }
+        with mock.patch.object(llm_usage.time, "time", return_value=1000):
+            line = llm_usage.openai_credit_status_line(body)
+        plain = llm_usage.ANSI_RE.sub("", line)
+        self.assertIn("next expires in 2h 00m", plain)
+        self.assertIn(llm_usage.fg256(203), line)
+
+    def test_reset_expiry_two_days_away_is_relative_and_yellow(self):
+        body = {
+            "rate_limit_reset_credits": {
+                "available_count": 1,
+                "credits": [
+                    {"status": "available", "expires_at": 173800},
+                ],
+            }
+        }
+        with mock.patch.object(llm_usage.time, "time", return_value=1000):
+            line = llm_usage.openai_credit_status_line(body)
+        plain = llm_usage.ANSI_RE.sub("", line)
+        self.assertIn("next expires in 2d 0h", plain)
+        self.assertIn(llm_usage.fg256(186), line)
+
+    def test_normalizes_app_server_reset_credit_shape(self):
+        result = llm_usage.normalize_codex_reset_credits({
+            "availableCount": 1,
+            "credits": [{
+                "id": "credit",
+                "resetType": "codexRateLimits",
+                "status": "available",
+                "grantedAt": 100,
+                "expiresAt": 200,
+                "title": "Full reset",
+                "description": "Fixture",
+            }],
+        })
+        self.assertEqual(result["available_count"], 1)
+        self.assertEqual(result["credits"][0]["reset_type"],
+                         "codexRateLimits")
+        self.assertEqual(result["credits"][0]["expires_at"], 200)
+
+    def test_next_reset_expiry_requires_complete_non_null_details(self):
+        capped = {
+            "rate_limit_reset_credits": {
+                "available_count": 2,
+                "credits": [
+                    {"status": "available", "expires_at": 2000},
+                ],
+            }
+        }
+        missing_expiry = {
+            "rate_limit_reset_credits": {
+                "available_count": 1,
+                "credits": [
+                    {"status": "available", "expires_at": None},
+                ],
+            }
+        }
+        with mock.patch.object(llm_usage.time, "time", return_value=1000):
+            self.assertIsNone(
+                llm_usage.openai_next_reset_credit_expiry(capped))
+            self.assertIsNone(
+                llm_usage.openai_next_reset_credit_expiry(missing_expiry))
+
+    def test_fetch_codex_merges_app_server_reset_credit_details(self):
+        usage = {
+            "rate_limit_reset_credits": {"available_count": 1},
+        }
+        details = {
+            "available_count": 1,
+            "credits": [
+                {"status": "available", "expires_at": 2000},
+            ],
+        }
+        with mock.patch.object(
+                llm_usage, "http_get_json",
+                return_value=(200, usage)), mock.patch.object(
+                llm_usage, "fetch_codex_reset_credit_details",
+                return_value=details):
+            code, body = llm_usage.fetch_codex({
+                "access_token": "fixture",
+                "account_id": "account",
+                "source": "auth_file",
+            })
+        self.assertEqual(code, 200)
+        self.assertEqual(body["rate_limit_reset_credits"], details)
+
+    def test_fetch_codex_does_not_mix_environment_token_with_local_codex(self):
+        usage = {
+            "rate_limit_reset_credits": {"available_count": 1},
+        }
+        with mock.patch.object(
+                llm_usage, "http_get_json",
+                return_value=(200, usage)), mock.patch.object(
+                llm_usage, "fetch_codex_reset_credit_details") as details:
+            _code, body = llm_usage.fetch_codex({
+                "access_token": "fixture",
+                "account_id": None,
+                "source": "environment",
+            })
+        details.assert_not_called()
+        self.assertEqual(
+            body["rate_limit_reset_credits"]["available_count"], 1)
+
+    def test_openai_cache_expires_at_next_reset_credit_expiry(self):
+        cached = {
+            "ts": 900.0,
+            "code": 200,
+            "body": {
+                "rate_limit_reset_credits": {
+                    "available_count": 1,
+                    "credits": [
+                        {"status": "available", "expires_at": 1000.0},
+                    ],
+                },
+            },
+        }
+        with mock.patch.object(
+                llm_usage, "_cache_path",
+                return_value="/fixture/openai.json"), mock.patch(
+                "builtins.open",
+                mock.mock_open(read_data=json.dumps(cached))), mock.patch.object(
+                llm_usage.time, "time", return_value=1001.0):
+            self.assertIsNone(llm_usage.cache_read("openai"))
 
 
 class AnthropicUsageTests(unittest.TestCase):
@@ -124,7 +263,7 @@ class AnthropicUsageTests(unittest.TestCase):
         self.assertEqual(spend["used"]["amount"], 5.0)
         self.assertEqual(spend["limit"]["amount"], 20.0)
 
-    def test_render_includes_spend_and_scoped_limit_status(self):
+    def test_render_includes_spend_without_redundant_limit_status(self):
         snapshot = {
             "token": {
                 "access_token": "fixture",
@@ -141,8 +280,9 @@ class AnthropicUsageTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("usage credits on", plain)
         self.assertIn("$12.34 / $50.00", plain)
-        self.assertIn("7-day Fable: warning", plain)
+        self.assertNotIn("7-day Fable: warning", plain)
         self.assertEqual(plain.count("7-day overall"), 1)
+        self.assertEqual(plain.count("7-day Fable"), 1)
         self.assertTrue(all(llm_usage.visible_len(line) <= 120
                             for line in lines))
 

@@ -41,6 +41,26 @@
     "overage_limit_reached": false
   },
   "rate_limit_reset_credits": {
-    "available_count": 2
+    "available_count": 2,
+    "credits": [
+      {
+        "id": "RateLimitResetCredit_1",
+        "reset_type": "codexRateLimits",
+        "status": "available",
+        "granted_at": 1890864000,
+        "expires_at": 1893456000,
+        "title": "Full reset",
+        "description": "Fixture reset credit"
+      },
+      {
+        "id": "RateLimitResetCredit_2",
+        "reset_type": "codexRateLimits",
+        "status": "available",
+        "granted_at": 1890950400,
+        "expires_at": 1893542400,
+        "title": "Full reset",
+        "description": "Fixture reset credit"
+      }
+    ]
   }
 }

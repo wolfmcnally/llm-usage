@@ -44,9 +44,13 @@ appear inline on the provider title line.
 Each provider can add an `Extras:` line. Anthropic shows it only when usage
 credits are enabled, have recorded spending, or need attention; ordinary
 disabled states stay hidden. OpenAI reports purchased-credit status and
-available usage-limit resets. Named model/feature-specific limits appear
-alongside the shared windows. The dashboard is read-only: manage Anthropic usage
-credits in Claude settings and redeem OpenAI resets in Codex itself.
+available usage-limit resets. When the installed Codex app server supplies
+complete reset-credit details, the earliest expiration is shown in local time
+and urgency-colored; expirations within three days also include a relative
+countdown. The tool falls back to the count when details are unavailable,
+incomplete, or have no expiration. Named model/feature-specific limits appear
+alongside the shared windows. The dashboard is read-only: manage Anthropic
+usage credits in Claude settings and redeem OpenAI resets in Codex itself.
 
 ## Model choice and usage
 
@@ -104,9 +108,12 @@ returns to normal cache-aware refresh behavior.
 `llm-usage --json` emits normalized provider windows for scripts and schedulers.
 The Anthropic object also includes normalized `usage_credits` and limit metadata
 such as `kind`, `is_active`, and `severity`. The OpenAI object includes
-`additional_rate_limits`, `credits`, and `rate_limit_reset_credits`. Relative
-reset countdowns are reduced by the age of the cached response; `reset_at`,
-when provided, remains the authoritative absolute timestamp.
+`additional_rate_limits`, `credits`, and `rate_limit_reset_credits`. Reset-credit
+output includes `details_complete`, `next_expires_at`, and
+`next_expires_in_seconds`; expiration fields are `null` unless every available
+credit has a reported expiration. Relative reset countdowns are reduced by the
+age of the cached response; `reset_at`, when provided, remains the authoritative
+absolute timestamp.
 
 ## Authentication
 
@@ -125,6 +132,14 @@ If a token is missing or rejected, run `claude` or `codex` once to log in / refr
 
 Tokens are read locally and sent only to the respective vendor's own API. OpenAI token expiry is determined by decoding the JWT locally (inspection only — never verified, never sent anywhere else).
 
+For OpenAI accounts loaded from `~/.codex/auth.json`, `llm-usage` also makes an
+optional, read-only `account/rateLimits/read` request through the installed
+[Codex app server](https://learn.chatgpt.com/docs/app-server#6-rate-limits-chatgpt).
+This supplies per-reset expiration timestamps that the direct usage response
+omits. Missing or older Codex installations continue to show the aggregate
+reset count, and `$CODEX_OAUTH_TOKEN` is never mixed with a potentially different
+account from the local Codex login.
+
 ## Caching
 
 The undocumented usage endpoints are rate-limited, so `llm-usage` calls each provider's API **at most once per success window**. Every successful response is cached on disk per provider; any run inside the TTL is served from cache with no network call and annotated `↻ cached Nm ago` on the provider title line.
@@ -134,7 +149,7 @@ The undocumented usage endpoints are rate-limited, so `llm-usage` calls each pro
 - **Bypass for one run:** `llm-usage --fresh` (alias `--no-cache`, or `LLM_USAGE_NO_CACHE=1`) hits the APIs live and refreshes the cache — including overriding an active 429 backoff.
 - **Other failures aren't cached** — a 401/network error retries on your next run rather than sticking around.
 - **Location:** `$XDG_CACHE_HOME/llm-usage/` (default `~/.cache/llm-usage/`).
-- The `--json` output includes `cached`, `cache_age_seconds`, and `rate_limited` per provider, plus Anthropic usage-credit spending and OpenAI credits/reset counts on successful responses.
+- The `--json` output includes `cached`, `cache_age_seconds`, and `rate_limited` per provider, plus Anthropic usage-credit spending and OpenAI credit/reset counts and the next complete-detail reset expiration on successful responses.
 
 ## Failure behavior
 
