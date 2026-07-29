@@ -14,8 +14,10 @@ to match the over/under/on-pace verdict:
 
 Provider-specific usage-credit/spending status, usage-limit reset count, and
 named model/feature-specific limit groups are shown when the usage responses
-include them. This dashboard is read-only; purchases, toggles, and reset
-redemption remain in the vendor apps.
+include them. Public provider status feeds are also checked; active service
+disruptions render as urgency-colored lines without changing usage exit codes.
+This dashboard is read-only; purchases, toggles, and reset redemption remain
+in the vendor apps.
 
 Tokens are loaded in this order:
 
@@ -55,6 +57,12 @@ LLM_USAGE_RATE_LIMIT_TTL (seconds; CACHE_TTL=0 disables caching entirely), or
 bypass for a single run with --fresh / --no-cache. Cache lives under
 $XDG_CACHE_HOME/llm-usage (default ~/.cache/llm-usage).
 
+Public status responses use separate persistent 60-second caches. Failed status
+refreshes retain the last known state and back off from five minutes to one
+hour; 429 Retry-After headers take precedence. Override the success interval
+with LLM_USAGE_STATUS_TTL. A status-site failure never becomes a false
+"operational" result and never hides otherwise valid usage data.
+
 No third-party dependencies — stdlib only. The provider SDKs do not expose
 these usage endpoints; both vendor CLIs hit them directly, and so do we.
 OpenAI reset-credit expiration details are optionally enriched through the
@@ -64,10 +72,12 @@ documented local Codex app-server interface.
 from __future__ import annotations
 
 import base64
+import email.utils
 import json
 import locale
 import os
 import queue
+import random
 import re
 import shutil
 import subprocess
@@ -248,20 +258,34 @@ def load_codex_token() -> dict | None:
 
 # ---------------------------------------------------------------- HTTP ----
 
-def http_get_json(url: str, headers: dict, timeout: int = 15
-                  ) -> tuple[int | None, Any]:
+def http_get_json_response(url: str, headers: dict, timeout: int = 15
+                           ) -> tuple[int | None, Any, dict[str, str]]:
+    """GET JSON without raising, preserving response headers for backoff."""
     req = urllib.request.Request(url, method="GET", headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status, json.loads(r.read().decode())
+            response_headers = {
+                key.lower(): value for key, value in r.headers.items()
+            }
+            return r.status, json.loads(r.read().decode()), response_headers
     except urllib.error.HTTPError as e:
+        response_headers = {
+            key.lower(): value
+            for key, value in (e.headers.items() if e.headers else [])
+        }
         try:
             body = json.loads(e.read().decode())
         except Exception:
             body = {"error": "http", "code": e.code}
-        return e.code, body
+        return e.code, body, response_headers
     except Exception as e:
-        return None, {"error": str(e)}
+        return None, {"error": str(e)}, {}
+
+
+def http_get_json(url: str, headers: dict, timeout: int = 15
+                  ) -> tuple[int | None, Any]:
+    code, body, _headers = http_get_json_response(url, headers, timeout)
+    return code, body
 
 
 def fetch_anthropic(tok: dict) -> tuple[int | None, Any]:
@@ -430,6 +454,9 @@ ANTHROPIC_CACHE_TTL = 1200     # seconds — Anthropic success: doubled. Its usa
                                # endpoint 429s harder under load, so we poll it
                                # at most half as often as the generic default.
 DEFAULT_RATE_LIMIT_TTL = 1200  # seconds — 429 backoff: "no new call for 20 min"
+DEFAULT_STATUS_TTL = 60        # public status pages: at most once per minute
+DEFAULT_STATUS_RETRY_TTL = 300 # failed status check: start with a 5m backoff
+MAX_STATUS_RETRY_TTL = 3600
 DEFAULT_TUI_RETRY_SECONDS = 60
 TUI_REPAINT_SECONDS = 60
 _CACHE_READ_BYPASS = False     # set by --fresh/--no-cache or env
@@ -576,6 +603,312 @@ def cache_notice(code: int | None, age: float | None) -> str | None:
     if age is None or code != 200:
         return None
     return f"{DIM}[↻ cached {fmt_relative(age)} ago]{RESET}"
+
+
+# ------------------------------------------------------ provider status ----
+
+STATUS_URLS = {
+    "anthropic": "https://status.claude.com/api/v2/summary.json",
+    "openai": "https://status.openai.com/api/v2/summary.json",
+}
+
+
+def status_ttl() -> int:
+    """Persistent public-status cache TTL; zero disables all caching."""
+    if _caching_off():
+        return 0
+    raw = os.environ.get("LLM_USAGE_STATUS_TTL")
+    if raw is None:
+        return DEFAULT_STATUS_TTL
+    try:
+        value = int(raw)
+        return value if value >= 0 else DEFAULT_STATUS_TTL
+    except ValueError:
+        return DEFAULT_STATUS_TTL
+
+
+def _status_cache_key(provider: str) -> str:
+    return f"status-{provider}"
+
+
+def _read_cache_document(cache_key: str) -> dict | None:
+    try:
+        with open(_cache_path(cache_key)) as f:
+            document = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return document if isinstance(document, dict) else None
+
+
+def _write_cache_document(cache_key: str, document: dict) -> None:
+    """Atomically persist a cache document; failures never break rendering."""
+    file_path = _cache_path(cache_key)
+    tmp = f"{file_path}.{os.getpid()}.tmp"
+    try:
+        os.makedirs(_cache_dir(), exist_ok=True)
+        with open(tmp, "w") as f:
+            json.dump(document, f)
+        os.replace(tmp, file_path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _retry_after_seconds(value: str | None, now: float) -> float | None:
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        retry_at = email.utils.parsedate_to_datetime(value)
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        return max(0.0, retry_at.timestamp() - now)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _status_retry_seconds(failures: int, retry_after: str | None,
+                          now: float) -> float:
+    explicit = _retry_after_seconds(retry_after, now)
+    if explicit is not None:
+        return max(1.0, explicit)
+    base = min(
+        MAX_STATUS_RETRY_TTL,
+        DEFAULT_STATUS_RETRY_TTL * (3 ** max(0, failures - 1)),
+    )
+    return max(1.0, base * random.uniform(0.9, 1.1))
+
+
+def normalize_provider_status(provider: str, body: Any) -> dict | None:
+    """Normalize the shared Statuspage-style summary response."""
+    if not isinstance(body, dict):
+        return None
+    raw_status = body.get("status")
+    if not isinstance(raw_status, dict):
+        return None
+    indicator = str(raw_status.get("indicator") or "unknown").lower()
+    description = str(
+        raw_status.get("description") or "Status unavailable").strip()
+    affected = []
+    for component in body.get("components") or []:
+        if not isinstance(component, dict):
+            continue
+        component_state = str(
+            component.get("status") or "unknown").lower()
+        if component_state not in ("operational",):
+            affected.append({
+                "name": str(component.get("name") or "Unknown component"),
+                "status": component_state,
+            })
+    return {
+        "provider": provider,
+        "indicator": indicator,
+        "description": description,
+        "operational": indicator == "none" and not affected,
+        "affected_components": affected,
+    }
+
+
+def _status_error_text(code: int | None, body: Any) -> str:
+    if code is None:
+        if isinstance(body, dict) and body.get("error"):
+            return str(body["error"])
+        return "network error"
+    if code == 200:
+        return "invalid status response"
+    return f"HTTP {code}"
+
+
+def provider_status_snapshot(provider: str) -> dict:
+    """Load a provider's public status with caching and stale-if-error.
+
+    A successful response is reused for at least a minute across processes.
+    Failed refreshes retain the last known state and establish a persistent,
+    escalating retry deadline so repeated CLI launches cannot hammer the site.
+    """
+    loaded_at = time.time()
+    cache_key = _status_cache_key(provider)
+    ttl = status_ttl()
+    cached = (
+        None if ttl <= 0 else _read_cache_document(cache_key)
+    )
+    cached = cached or {}
+    cached_body = cached.get("body")
+    cached_ts = cached.get("ts")
+    retry_at = cached.get("retry_at")
+
+    if (not _CACHE_READ_BYPASS and isinstance(retry_at, (int, float))
+            and retry_at > loaded_at):
+        return {
+            "provider": provider,
+            "status": normalize_provider_status(provider, cached_body),
+            "cached": cached_body is not None,
+            "stale": True,
+            "age": (max(0.0, loaded_at - cached_ts)
+                    if isinstance(cached_ts, (int, float)) else None),
+            "error": cached.get("last_error") or "status refresh failed",
+            "loaded_at": loaded_at,
+            "deadline": float(retry_at),
+        }
+
+    if (not _CACHE_READ_BYPASS and ttl > 0
+            and isinstance(cached_ts, (int, float))
+            and loaded_at >= cached_ts
+            and loaded_at - cached_ts <= ttl):
+        return {
+            "provider": provider,
+            "status": normalize_provider_status(provider, cached_body),
+            "cached": True,
+            "stale": False,
+            "age": loaded_at - cached_ts,
+            "error": None,
+            "loaded_at": loaded_at,
+            "deadline": cached_ts + ttl,
+        }
+
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "llm-usage/1 status-monitor",
+    }
+    if cached.get("etag"):
+        headers["If-None-Match"] = str(cached["etag"])
+    code, body, response_headers = http_get_json_response(
+        STATUS_URLS[provider], headers)
+
+    if code == 304 and cached_body is not None:
+        document = {
+            "ts": loaded_at,
+            "body": cached_body,
+            "etag": response_headers.get("etag") or cached.get("etag"),
+            "failures": 0,
+            "retry_at": None,
+            "last_error": None,
+        }
+        if ttl > 0:
+            _write_cache_document(cache_key, document)
+        return {
+            "provider": provider,
+            "status": normalize_provider_status(provider, cached_body),
+            "cached": True,
+            "stale": False,
+            "age": 0.0,
+            "error": None,
+            "loaded_at": loaded_at,
+            "deadline": loaded_at + max(1, ttl or DEFAULT_STATUS_TTL),
+        }
+
+    normalized = normalize_provider_status(provider, body)
+    if code == 200 and normalized is not None:
+        document = {
+            "ts": loaded_at,
+            "body": body,
+            "etag": response_headers.get("etag"),
+            "failures": 0,
+            "retry_at": None,
+            "last_error": None,
+        }
+        if ttl > 0:
+            _write_cache_document(cache_key, document)
+        return {
+            "provider": provider,
+            "status": normalized,
+            "cached": False,
+            "stale": False,
+            "age": None,
+            "error": None,
+            "loaded_at": loaded_at,
+            "deadline": loaded_at + max(1, ttl or DEFAULT_STATUS_TTL),
+        }
+
+    failures = max(0, int(cached.get("failures") or 0)) + 1
+    retry_seconds = _status_retry_seconds(
+        failures, response_headers.get("retry-after"), loaded_at)
+    retry_at = loaded_at + retry_seconds
+    error = _status_error_text(code, body)
+    if ttl > 0:
+        document = dict(cached)
+        document.update({
+            "failures": failures,
+            "retry_at": retry_at,
+            "last_error": error,
+            "last_attempt": loaded_at,
+        })
+        _write_cache_document(cache_key, document)
+    return {
+        "provider": provider,
+        "status": normalize_provider_status(provider, cached_body),
+        "cached": cached_body is not None,
+        "stale": True,
+        "age": (max(0.0, loaded_at - cached_ts)
+                if isinstance(cached_ts, (int, float)) else None),
+        "error": error,
+        "loaded_at": loaded_at,
+        "deadline": retry_at,
+    }
+
+
+def provider_status_json(snapshot: dict | None) -> dict:
+    snapshot = snapshot or {}
+    normalized = snapshot.get("status")
+    return {
+        "available": normalized is not None,
+        "operational": (
+            normalized.get("operational") if normalized is not None else None
+        ),
+        "indicator": (
+            normalized.get("indicator") if normalized is not None else None
+        ),
+        "description": (
+            normalized.get("description") if normalized is not None else None
+        ),
+        "affected_components": (
+            normalized.get("affected_components")
+            if normalized is not None else []
+        ),
+        "cached": bool(snapshot.get("cached")),
+        "stale": bool(snapshot.get("stale")),
+        "cache_age_seconds": snapshot.get("age"),
+        "error": snapshot.get("error"),
+    }
+
+
+def provider_status_line(snapshot: dict | None) -> str | None:
+    snapshot = snapshot or {}
+    normalized = snapshot.get("status")
+    stale = bool(snapshot.get("stale"))
+    error = snapshot.get("error")
+    if normalized is None:
+        if error:
+            return (f"  {fg256(214)}? Service status unavailable "
+                    f"({error}){RESET}")
+        return None
+
+    if normalized.get("operational") and not stale:
+        return None
+    indicator = normalized.get("indicator")
+    if indicator in ("major", "critical"):
+        color = fg256(203)
+    elif indicator == "minor":
+        color = fg256(214)
+    else:
+        color = fg256(186)
+    text = str(normalized.get("description") or "Service disruption")
+    if stale:
+        age = snapshot.get("age")
+        confirmed = (
+            f", last confirmed {fmt_relative(age)} ago"
+            if isinstance(age, (int, float)) else ", last confirmed earlier"
+        )
+        if normalized.get("operational"):
+            return (f"  {fg256(214)}? Service status unavailable; "
+                    f"last known: {text}{confirmed}{RESET}")
+        text += confirmed
+    return f"  {color}● Service status: {text}{RESET}"
 
 
 # ----------------------------------------------------------- bar render ----
@@ -1121,6 +1454,9 @@ def render_anthropic_section(snapshot: dict, width: int) -> tuple[list[str], boo
     tok = snapshot.get("token")
     if not tok or not tok.get("access_token"):
         lines.extend(section_header("ANTHROPIC", "Claude", width))
+        service_line = provider_status_line(snapshot.get("service_status"))
+        if service_line:
+            lines.append(service_line)
         lines.append(warn_line("no OAuth token "
                                "(set $CLAUDE_CODE_OAUTH_TOKEN or run `claude` "
                                "to login)"))
@@ -1141,6 +1477,9 @@ def render_anthropic_section(snapshot: dict, width: int) -> tuple[list[str], boo
         width,
         [status, expiry],
     ))
+    service_line = provider_status_line(snapshot.get("service_status"))
+    if service_line:
+        lines.append(service_line)
     if code == 401:
         lines.append(warn_line("token rejected (401)"
                                + (" — expired" if expired else "")
@@ -1394,6 +1733,9 @@ def render_openai_section(snapshot: dict, width: int,
     tok = snapshot.get("token")
     if not tok or not tok.get("access_token"):
         lines.extend(section_header("OPENAI", "ChatGPT", width))
+        service_line = provider_status_line(snapshot.get("service_status"))
+        if service_line:
+            lines.append(service_line)
         lines.append(warn_line("no OAuth token "
                                "(set $CODEX_OAUTH_TOKEN or run `codex` "
                                "to login)"))
@@ -1414,6 +1756,9 @@ def render_openai_section(snapshot: dict, width: int,
         width,
         [status, expiry],
     ))
+    service_line = provider_status_line(snapshot.get("service_status"))
+    if service_line:
+        lines.append(service_line)
 
     if code == 401:
         lines.append(warn_line("token rejected (401)"
@@ -1482,17 +1827,22 @@ def render_openai_section(snapshot: dict, width: int,
 # as a percent (0-100) plus seconds-until-reset. Each provider also includes
 # its provider-specific additional limits and read-only credit/spend status.
 
-def _anthropic_json() -> dict:
+def _anthropic_json(service_status_snapshot: dict | None = None) -> dict:
+    if service_status_snapshot is None:
+        service_status_snapshot = provider_status_snapshot("anthropic")
+    service_status = provider_status_json(service_status_snapshot)
     tok = load_anthropic_token()
     if not tok or not tok.get("access_token"):
         return {"ok": False, "error": "no OAuth token", "windows": {},
-                "cached": False, "cache_age_seconds": None}
+                "cached": False, "cache_age_seconds": None,
+                "service_status": service_status}
     code, a, age = cached_fetch("anthropic", fetch_anthropic, tok)
     if code != 200:
         err = "rate limited (429)" if code == 429 else f"API error {code}"
         return {"ok": False, "error": err, "windows": {},
                 "rate_limited": code == 429,
-                "cached": age is not None, "cache_age_seconds": age}
+                "cached": age is not None, "cache_age_seconds": age,
+                "service_status": service_status}
     now = datetime.now(timezone.utc)
     windows: dict[str, Any] = {}
     for band in anthropic_limit_bands(a):
@@ -1511,21 +1861,27 @@ def _anthropic_json() -> dict:
     return {"ok": True, "error": None,
             "subscription": tok.get("subscription"), "windows": windows,
             "usage_credits": normalize_anthropic_spend(a),
-            "cached": age is not None, "cache_age_seconds": age}
+            "cached": age is not None, "cache_age_seconds": age,
+            "service_status": service_status}
 
 
-def _openai_json() -> dict:
+def _openai_json(service_status_snapshot: dict | None = None) -> dict:
+    if service_status_snapshot is None:
+        service_status_snapshot = provider_status_snapshot("openai")
+    service_status = provider_status_json(service_status_snapshot)
     loaded_at = time.time()
     tok = load_codex_token()
     if not tok or not tok.get("access_token"):
         return {"ok": False, "error": "no OAuth token", "windows": {},
-                "cached": False, "cache_age_seconds": None}
+                "cached": False, "cache_age_seconds": None,
+                "service_status": service_status}
     code, o, age = cached_fetch("openai", fetch_codex, tok)
     if code != 200:
         err = "rate limited (429)" if code == 429 else f"API error {code}"
         return {"ok": False, "error": err, "windows": {},
                 "rate_limited": code == 429,
-                "cached": age is not None, "cache_age_seconds": age}
+                "cached": age is not None, "cache_age_seconds": age,
+                "service_status": service_status}
     rl = o.get("rate_limit") or {}
     snapshot = {"loaded_at": loaded_at, "age": age}
     windows: dict[str, Any] = {}
@@ -1581,7 +1937,8 @@ def _openai_json() -> dict:
                     credits.get("overage_limit_reached")),
             },
             "rate_limit_reset_credits": reset_credit_json,
-            "cached": age is not None, "cache_age_seconds": age}
+            "cached": age is not None, "cache_age_seconds": age,
+            "service_status": service_status}
 
 
 def emit_json() -> int:
@@ -1594,9 +1951,18 @@ def emit_json() -> int:
 # ------------------------------------------------------------ dashboard ----
 
 def load_dashboard_snapshot() -> dict:
+    anthropic_status = provider_status_snapshot("anthropic")
+    openai_status = provider_status_snapshot("openai")
     a = anthropic_snapshot()
     o = openai_snapshot()
-    deadline = min(float(a["deadline"]), float(o["deadline"]))
+    a["service_status"] = anthropic_status
+    o["service_status"] = openai_status
+    deadline = min(
+        float(a["deadline"]),
+        float(o["deadline"]),
+        float(anthropic_status["deadline"]),
+        float(openai_status["deadline"]),
+    )
     return {"anthropic": a, "openai": o, "deadline": deadline}
 
 

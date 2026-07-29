@@ -5,6 +5,7 @@ A terminal dashboard for your **Anthropic (Claude)** and **OpenAI (ChatGPT/Codex
 ```text
 ANTHROPIC  Claude Max Plan  [⚠ OAuth expires in 3h 19m]      Wed Jun 03 13:51 MDT
 ──────────────────────────────────────────────────────────────────────────────────
+  ● Service status: Partial System Outage
                                            45%  ▼  ↑ +12pp over pace · in 3d 20h
 7-day overall  57% ███████████████████████████████░░░░░░░░░░░░░░░░░░░░░
                           18%  ▼  ↓ -6pp under pace · in 4h 10m
@@ -36,6 +37,13 @@ The relationship between the two is the real signal:
 | Bar ends **at** the `▼` (white `▼`, `≈ on pace`) | Within ±5 percentage points of even burn |
 
 Each band also shows its time remaining. A red `↑` after a bar means usage reported over 100%.
+
+The dashboard checks the public [Anthropic](https://status.claude.com/) and
+[OpenAI](https://status.openai.com/) status feeds. Operational status stays
+quiet; an active disruption appears directly below the affected provider
+heading, colored yellow for a minor incident and red for a major or critical
+incident. Status monitoring is independent of authentication and does not
+consume model API quota.
 
 OAuth token expiry is shown only when a provider token is expired or has 4 hours
 or less remaining, with a red warning inside 1 hour. Expiry and cache notices
@@ -113,7 +121,9 @@ output includes `details_complete`, `next_expires_at`, and
 `next_expires_in_seconds`; expiration fields are `null` unless every available
 credit has a reported expiration. Relative reset countdowns are reduced by the
 age of the cached response; `reset_at`, when provided, remains the authoritative
-absolute timestamp.
+absolute timestamp. Both provider objects include a normalized `service_status`
+object with availability, operational state, incident indicator and description,
+affected components, cache age, staleness, and any refresh error.
 
 ## Authentication
 
@@ -150,6 +160,22 @@ The undocumented usage endpoints are rate-limited, so `llm-usage` calls each pro
 - **Other failures aren't cached** — a 401/network error retries on your next run rather than sticking around.
 - **Location:** `$XDG_CACHE_HOME/llm-usage/` (default `~/.cache/llm-usage/`).
 - The `--json` output includes `cached`, `cache_age_seconds`, and `rate_limited` per provider, plus Anthropic usage-credit spending and OpenAI credit/reset counts and the next complete-detail reset expiration on successful responses.
+
+Public status feeds have their own persistent cache and failure policy:
+
+- **Success TTL:** **60 seconds** by default. Override it with
+  `LLM_USAGE_STATUS_TTL=<seconds>`.
+- **Conditional refreshes:** Anthropic responses supply an `ETag`, which is
+  reused with `If-None-Match` after the cache expires.
+- **Failure backoff:** network, server, and malformed-response failures retain
+  the last known state and retry after approximately 5 minutes, then 15 minutes,
+  then 1 hour. An HTTP `Retry-After` header takes precedence.
+- **No false reassurance:** a failed refresh never becomes “operational.” The
+  dashboard either labels the last known state as stale or reports status as
+  unavailable. Status failures do not suppress valid usage data or change the
+  process exit code.
+- `--fresh` also bypasses an active status cache/backoff for that one run.
+  `LLM_USAGE_CACHE_TTL=0` disables both usage and status caching.
 
 ## Failure behavior
 

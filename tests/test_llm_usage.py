@@ -19,6 +19,172 @@ llm_usage = importlib.util.module_from_spec(spec)
 loader.exec_module(llm_usage)
 
 
+def service_status_snapshot(provider, indicator="none",
+                            description="All Systems Operational"):
+    return {
+        "provider": provider,
+        "status": {
+            "provider": provider,
+            "indicator": indicator,
+            "description": description,
+            "operational": indicator == "none",
+            "affected_components": [],
+        },
+        "cached": False,
+        "stale": False,
+        "age": None,
+        "error": None,
+        "loaded_at": 1000.0,
+        "deadline": 1060.0,
+    }
+
+
+class ProviderStatusTests(unittest.TestCase):
+    def test_normalizes_affected_components(self):
+        result = llm_usage.normalize_provider_status("anthropic", {
+            "status": {
+                "indicator": "major",
+                "description": "Partial System Outage",
+            },
+            "components": [
+                {"name": "Claude API", "status": "major_outage"},
+                {"name": "Console", "status": "operational"},
+            ],
+        })
+        self.assertFalse(result["operational"])
+        self.assertEqual(result["indicator"], "major")
+        self.assertEqual(result["affected_components"], [{
+            "name": "Claude API",
+            "status": "major_outage",
+        }])
+
+    def test_outage_is_highlighted_and_operational_status_is_quiet(self):
+        outage = service_status_snapshot(
+            "anthropic", "major", "Partial System Outage")
+        line = llm_usage.provider_status_line(outage)
+        self.assertIn("Service status: Partial System Outage", line)
+        self.assertIn(llm_usage.fg256(203), line)
+        self.assertIsNone(llm_usage.provider_status_line(
+            service_status_snapshot("openai")))
+
+    def test_fresh_disk_cache_avoids_network_request(self):
+        cached = {
+            "ts": 990.0,
+            "body": {
+                "status": {
+                    "indicator": "none",
+                    "description": "All Systems Operational",
+                },
+                "components": [],
+            },
+        }
+        with mock.patch.object(
+                llm_usage, "_read_cache_document",
+                return_value=cached), mock.patch.object(
+                llm_usage, "http_get_json_response") as request, \
+                mock.patch.object(llm_usage.time, "time", return_value=1000.0):
+            result = llm_usage.provider_status_snapshot("openai")
+        request.assert_not_called()
+        self.assertTrue(result["cached"])
+        self.assertFalse(result["stale"])
+        self.assertTrue(result["status"]["operational"])
+        self.assertEqual(result["deadline"], 1050.0)
+
+    def test_failed_refresh_preserves_last_known_outage_and_backs_off(self):
+        cached = {
+            "ts": 900.0,
+            "body": {
+                "status": {
+                    "indicator": "major",
+                    "description": "Partial System Outage",
+                },
+                "components": [],
+            },
+            "failures": 0,
+        }
+        with mock.patch.object(
+                llm_usage, "_read_cache_document",
+                return_value=cached), mock.patch.object(
+                llm_usage, "http_get_json_response",
+                return_value=(503, {"error": "unavailable"}, {})), \
+                mock.patch.object(
+                    llm_usage, "_write_cache_document") as write, \
+                mock.patch.object(
+                    llm_usage.random, "uniform", return_value=1.0), \
+                mock.patch.object(llm_usage.time, "time", return_value=1000.0):
+            result = llm_usage.provider_status_snapshot("anthropic")
+        self.assertTrue(result["stale"])
+        self.assertFalse(result["status"]["operational"])
+        self.assertEqual(result["deadline"], 1300.0)
+        written = write.call_args.args[1]
+        self.assertEqual(written["body"], cached["body"])
+        self.assertEqual(written["retry_at"], 1300.0)
+
+    def test_etag_revalidation_reuses_body_after_304(self):
+        cached = {
+            "ts": 900.0,
+            "body": {
+                "status": {
+                    "indicator": "none",
+                    "description": "All Systems Operational",
+                },
+                "components": [],
+            },
+            "etag": 'W/"fixture"',
+        }
+        with mock.patch.object(
+                llm_usage, "_read_cache_document",
+                return_value=cached), mock.patch.object(
+                llm_usage, "http_get_json_response",
+                return_value=(304, {"error": "http"},
+                              {"etag": 'W/"fixture"'})) as request, \
+                mock.patch.object(
+                    llm_usage, "_write_cache_document") as write, \
+                mock.patch.object(llm_usage.time, "time", return_value=1000.0):
+            result = llm_usage.provider_status_snapshot("anthropic")
+        self.assertEqual(
+            request.call_args.args[1]["If-None-Match"], 'W/"fixture"')
+        self.assertTrue(result["status"]["operational"])
+        self.assertFalse(result["stale"])
+        self.assertEqual(write.call_args.args[1]["ts"], 1000.0)
+
+    def test_zero_status_ttl_does_not_read_or_write_cache(self):
+        with mock.patch.dict(
+                llm_usage.os.environ, {"LLM_USAGE_STATUS_TTL": "0"}), \
+                mock.patch.object(
+                    llm_usage, "_read_cache_document") as read, \
+                mock.patch.object(
+                    llm_usage, "_write_cache_document") as write, \
+                mock.patch.object(
+                    llm_usage, "http_get_json_response",
+                    return_value=(200, {
+                        "status": {
+                            "indicator": "none",
+                            "description": "All Systems Operational",
+                        },
+                        "components": [],
+                    }, {})), mock.patch.object(
+                    llm_usage.time, "time", return_value=1000.0):
+            result = llm_usage.provider_status_snapshot("openai")
+        read.assert_not_called()
+        write.assert_not_called()
+        self.assertTrue(result["status"]["operational"])
+
+    def test_retry_after_header_controls_429_backoff(self):
+        with mock.patch.object(
+                llm_usage, "_read_cache_document",
+                return_value=None), mock.patch.object(
+                llm_usage, "http_get_json_response",
+                return_value=(429, {"error": "limited"},
+                              {"retry-after": "120"})), mock.patch.object(
+                llm_usage, "_write_cache_document"), mock.patch.object(
+                llm_usage.time, "time", return_value=1000.0):
+            result = llm_usage.provider_status_snapshot("openai")
+        self.assertTrue(result["stale"])
+        self.assertIsNone(result["status"])
+        self.assertEqual(result["deadline"], 1120.0)
+
+
 class OpenAIUsageTests(unittest.TestCase):
     def setUp(self):
         self.body = json.loads(OPENAI_FIXTURE_PATH.read_text())
@@ -65,7 +231,8 @@ class OpenAIUsageTests(unittest.TestCase):
                 llm_usage, "cached_fetch",
                 return_value=(200, self.body, 120.0)), mock.patch.object(
                 llm_usage.time, "time", return_value=1000.0):
-            result = llm_usage._openai_json()
+            result = llm_usage._openai_json(
+                service_status_snapshot("openai"))
 
         self.assertTrue(result["ok"])
         self.assertEqual(
@@ -81,6 +248,7 @@ class OpenAIUsageTests(unittest.TestCase):
             result["rate_limit_reset_credits"]["next_expires_at"],
             1893456000.0,
         )
+        self.assertTrue(result["service_status"]["operational"])
         self.assertEqual(len(result["additional_rate_limits"]), 1)
         extra = result["additional_rate_limits"][0]
         self.assertEqual(extra["name"], "GPT-5.3-Codex-Spark")
@@ -322,7 +490,8 @@ class AnthropicUsageTests(unittest.TestCase):
                               "subscription": "max"}), mock.patch.object(
                 llm_usage, "cached_fetch",
                 return_value=(200, self.body, 120.0)):
-            result = llm_usage._anthropic_json()
+            result = llm_usage._anthropic_json(
+                service_status_snapshot("anthropic"))
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["windows"]["seven_day"]["utilization"], 40.0)
@@ -330,6 +499,7 @@ class AnthropicUsageTests(unittest.TestCase):
         self.assertEqual(scoped["kind"], "weekly_scoped")
         self.assertEqual(scoped["severity"], "warning")
         self.assertEqual(result["usage_credits"]["source"], "spend")
+        self.assertTrue(result["service_status"]["operational"])
         self.assertEqual(result["usage_credits"]["used"]["amount"], 12.34)
 
 

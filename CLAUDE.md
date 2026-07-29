@@ -30,6 +30,7 @@ when supported, and `q`/`Esc`/`Ctrl-C` to quit. The TUI refetches data when
 cache/backoff deadlines expire, repaints every 60 seconds for countdowns and
 cache ages, and redraws without fetching on resize or scroll. OAuth-expiry and
 cache-status notices render inline on the provider title line when present.
+Public provider-status disruptions render below the corresponding title.
 
 Run `python3 -m unittest discover -s tests -v`, then verify display changes by
 running the script directly. Note: the Anthropic endpoint occasionally returns
@@ -55,6 +56,14 @@ Overrides:
 
 Writes are atomic (`os.replace` of a pid-suffixed temp file) and entirely best-effort — cache I/O errors never break a render. Both the TUI and `--json` paths funnel through `cached_fetch`.
 
+Public status monitoring uses separate `status-{anthropic,openai}.json` cache
+documents and a 60-second default TTL (`LLM_USAGE_STATUS_TTL`). Refresh failures
+preserve the last successful body and establish a persistent jittered backoff:
+5 minutes, 15 minutes, then 1 hour. `Retry-After` takes precedence, and
+Anthropic `ETag` values are sent back as `If-None-Match`. Never turn a failed
+status request into an operational state. Status failures are informational and
+must not change the usage-oriented exit code.
+
 ## Hard constraints
 
 - **Stdlib only.** No third-party imports, ever. The provider SDKs do not expose these usage endpoints; the script calls them directly with `urllib`, mimicking each vendor CLI's headers (see `fetch_anthropic` / `fetch_codex` — the `User-Agent`, `anthropic-beta`, `Originator`, and `Chatgpt-Account-Id` headers are required by the endpoints, not decoration).
@@ -68,8 +77,11 @@ Top-to-bottom pipeline, one section per provider, each failing independently:
 
 1. **Token loaders** (`load_anthropic_token`, `load_codex_token`) — chain of sources: env var → macOS Keychain (`security find-generic-password`, Anthropic only) → credential file (`~/.claude/.credentials.json` / `~/.codex/auth.json`). Codex token expiry comes from locally decoding the access token's JWT `exp` claim (`jwt_claims` — unverified by design, inspection only). OAuth expiry warnings render only when the token is expired or has 4 hours or less remaining.
 2. **Fetchers** (`fetch_anthropic`, `fetch_codex`) — GET the undocumented usage endpoints (`api.anthropic.com/api/oauth/usage`, `chatgpt.com/backend-api/wham/usage`) via `http_get_json`, which never raises: it returns `(status_or_None, body)`.
-3. **Snapshots + sections** (`anthropic_snapshot` / `openai_snapshot`, then `render_anthropic_section` / `render_openai_section`) — each provider fetch/load happens once per data refresh, then renders independently and degrades any failure (no token, 401, API error) to an inline `warn_line` so the other section still renders. Anthropic's canonical `limits[]` entries describe session, all-model weekly, and model/surface-scoped weekly limits; `anthropic_limit_bands` falls back to stable legacy top-level fields when generic entries are absent. Anthropic `spend` is canonical for usage credits, with `extra_usage` as the cents-based legacy fallback; its `Extras:` line stays hidden for the ordinary disabled/zero-spend state. OpenAI returns shared `rate_limit.{primary,secondary}_window` data, optional named `additional_rate_limits[]`, purchased-credit status, and an aggregate usage-limit reset count. Keep credit purchase/toggle/reset redemption in the vendor apps; this dashboard is read-only.
-4. **Row renderer** (`row`) — the core visual idea: each band is a 2-line block where line 0 places the elapsed-window percentage plus `▼` at the percent-of-window-elapsed position above a usage bar (line 1), so bar-end vs. `▼` position *is* the over/under-pace signal. The pace verdict and reset countdown sit to the right of the marker when they fit, or just before the marker when the right side is tight, without moving the marker column; adjacent auxiliary segments are separated with a bullet, and the marker is padded from the surrounding labels. Provider sections compute a compact shared label/usage-percent layout from the visible rows, so all bars in that section align to the longest visible label with a small gap. Pace verdict (±5pp threshold) colors the elapsed label, marker, and pace label together.
+3. **Public status** (`provider_status_snapshot`) — checks the providers'
+   anonymous summary feeds independently of OAuth, normalizes their shared
+   Statuspage-style shape, and retains last-known state through failures.
+4. **Snapshots + sections** (`anthropic_snapshot` / `openai_snapshot`, then `render_anthropic_section` / `render_openai_section`) — each provider fetch/load happens once per data refresh, then renders independently and degrades any failure (no token, 401, API error) to an inline `warn_line` so the other section still renders. Anthropic's canonical `limits[]` entries describe session, all-model weekly, and model/surface-scoped weekly limits; `anthropic_limit_bands` falls back to stable legacy top-level fields when generic entries are absent. Anthropic `spend` is canonical for usage credits, with `extra_usage` as the cents-based legacy fallback; its `Extras:` line stays hidden for the ordinary disabled/zero-spend state. OpenAI returns shared `rate_limit.{primary,secondary}_window` data, optional named `additional_rate_limits[]`, purchased-credit status, and an aggregate usage-limit reset count. Keep credit purchase/toggle/reset redemption in the vendor apps; this dashboard is read-only.
+5. **Row renderer** (`row`) — the core visual idea: each band is a 2-line block where line 0 places the elapsed-window percentage plus `▼` at the percent-of-window-elapsed position above a usage bar (line 1), so bar-end vs. `▼` position *is* the over/under-pace signal. The pace verdict and reset countdown sit to the right of the marker when they fit, or just before the marker when the right side is tight, without moving the marker column; adjacent auxiliary segments are separated with a bullet, and the marker is padded from the surrounding labels. Provider sections compute a compact shared label/usage-percent layout from the visible rows, so all bars in that section align to the longest visible label with a small gap. Pace verdict (±5pp threshold) colors the elapsed label, marker, and pace label together.
 
 The render path now uses provider snapshots: data fetch/load happens once, then
 `render_dashboard_snapshot` can repaint the same snapshot at a new width or a
