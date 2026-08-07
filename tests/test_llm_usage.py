@@ -1,6 +1,7 @@
 import importlib.machinery
 import importlib.util
 import json
+import socket
 import threading
 import urllib.error
 import urllib.request
@@ -589,6 +590,31 @@ class HtmlOutputTests(unittest.TestCase):
         self.assertIsNone(static_path)
         self.assertIn("output path", error)
 
+    def test_parse_port_flag(self):
+        self.assertEqual(llm_usage.parse_port_flag(["--html"]), (None, None))
+        self.assertEqual(
+            llm_usage.parse_port_flag(["--html", "--port", "17398"]),
+            (17398, None))
+        for bad in (["--port"], ["--port", "abc"], ["--port", "0"],
+                    ["--port", "65536"]):
+            port, error = llm_usage.parse_port_flag(bad)
+            self.assertIsNone(port)
+            self.assertIn("--port", error)
+
+    def test_run_html_server_fails_hard_when_port_is_taken(self):
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            blocker.bind(("127.0.0.1", 0))
+            blocker.listen(1)
+            taken_port = blocker.getsockname()[1]
+            with mock.patch.object(llm_usage.webbrowser, "open") as opened, \
+                    mock.patch.object(llm_usage.sys, "stderr"):
+                exit_code = llm_usage.run_html_server(False, port=taken_port)
+        finally:
+            blocker.close()
+        self.assertEqual(exit_code, 2)
+        opened.assert_not_called()
+
     def test_write_html_static_writes_snapshot_page(self):
         import tempfile
         with mock.patch.object(llm_usage, "usage_payload",
@@ -603,7 +629,8 @@ class HtmlOutputTests(unittest.TestCase):
         self.assertIn('"generated_at"', page)
 
     def test_html_server_serves_dashboard_and_data(self):
-        server = llm_usage.create_html_server(lambda: dict(self.PAYLOAD))
+        server = llm_usage.create_html_server(
+            lambda: dict(self.PAYLOAD), port=0)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         base = f"http://127.0.0.1:{server.server_address[1]}"

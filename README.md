@@ -119,7 +119,12 @@ returns to normal cache-aware refresh behavior.
 </picture>
 
 `llm-usage --html` serves a display-only browser dashboard from a loopback HTTP
-server and opens it in your preferred browser. Each limit window is the CLI's
+server at the stable, bookmarkable **`http://127.0.0.1:17399/`** and opens it in
+your preferred browser. (17399 is IANA-unassigned, claimed by no known product,
+and below every OS ephemeral-port range.) Pass `--port <n>` to serve elsewhere
+for a run; if the port cannot be bound — most likely another `llm-usage --html`
+is already running — the tool fails hard with exit code `2` rather than
+silently moving to a different port. Each limit window is the CLI's
 pace instrument translated to the page: a status-colored usage fill, a thin
 "now" tick at the percent-of-window-elapsed position, and the interval between
 them painted as green headroom or red overrun. The page follows the system

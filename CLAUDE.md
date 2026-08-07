@@ -30,9 +30,15 @@ combination exits 2, as does `--html-static` without a path. In TUI mode,
 refreshes are cache-aware — `--html` treats `--fresh` the same way (initial
 payload only).
 
-`--html` binds an ephemeral port on 127.0.0.1, prints the URL (flushed), opens
+`--html` binds the pinned port 17399 on 127.0.0.1 (stable URL
+`http://127.0.0.1:17399/`; 17399 is IANA-unassigned, unclaimed by known
+products, and below all OS ephemeral ranges), prints the URL (flushed), opens
 it via `webbrowser`, and serves `/` (page with embedded payload) plus
-`/data.json` until Ctrl-C (exit 0). Every payload is produced by running
+`/data.json` until Ctrl-C (exit 0). `--port <n>` overrides the port for one
+run (valid only with `--html`); a failed bind is a hard exit-2 error with a
+pointer to `--port`, never a silent fallback port. **Agent/testing runs must
+pass `--port 17398`** (also verified unassigned) so they can never collide
+with Wolf's live dashboard instance on 17399. Every payload is produced by running
 `llm-usage --json` as a subprocess, so the HTML surface shares the exact
 source of truth and cache/backoff behavior of the JSON path — never fetch
 provider data for HTML any other way. The page re-renders locally every

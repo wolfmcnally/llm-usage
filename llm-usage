@@ -42,7 +42,8 @@ Exit codes: 0 = both providers OK, 1 = one provider failed, 2 = both failed.
 
 Output modes (choose at most one): the default one-shot ANSI render, --json
 (machine-readable snapshot), --tui (interactive curses view), --html (serves a
-display-only browser dashboard on 127.0.0.1, opens it in the preferred
+display-only browser dashboard at http://127.0.0.1:17399/ — override with
+--port <n>; a failed bind is a hard exit-2 error — opens it in the preferred
 browser, and keeps updating it — via `llm-usage --json` subprocess calls, so
 the same cache and backoff apply — until this invocation is terminated; exits
 0 on Ctrl-C), and --html-static <path> (writes one self-contained snapshot
@@ -1986,6 +1987,14 @@ def emit_json() -> int:
 
 HTML_POLL_SECONDS = 60
 
+# Pinned dashboard port so the URL is stable across runs (bookmarkable,
+# recognizable in `lsof`). 17399 is IANA-unassigned, absent from
+# /etc/services, claimed by no known product, below the Linux (32768+) and
+# macOS (49152+) ephemeral ranges, and on no browser unsafe-port blocklist.
+# Override per run with --port; a failed bind is a hard error, not a
+# silent fallback to a different port.
+DEFAULT_HTML_PORT = 17399
+
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2544,8 +2553,11 @@ def write_html_static(file_path: str, fresh: bool) -> int:
     return payload_exit_code(payload)
 
 
-def create_html_server(payload_fn) -> ThreadingHTTPServer:
-    """Loopback HTTP server for the live dashboard: / and /data.json."""
+def create_html_server(payload_fn, port: int) -> ThreadingHTTPServer:
+    """Loopback HTTP server for the live dashboard: / and /data.json.
+
+    Raises OSError when the port cannot be bound; callers decide policy.
+    """
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):  # noqa: N802 — BaseHTTPRequestHandler API
@@ -2579,10 +2591,10 @@ def create_html_server(payload_fn) -> ThreadingHTTPServer:
         def log_message(self, *_args):
             pass  # keep the terminal quiet; the page is the output
 
-    return ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    return ThreadingHTTPServer(("127.0.0.1", port), Handler)
 
 
-def run_html_server(fresh: bool) -> int:
+def run_html_server(fresh: bool, port: int = DEFAULT_HTML_PORT) -> int:
     lock = threading.Lock()
     state = {"fresh": fresh}
 
@@ -2592,9 +2604,16 @@ def run_html_server(fresh: bool) -> int:
             state["fresh"] = False
             return usage_payload(use_fresh)
 
-    server = create_html_server(payload_now)
-    port = server.server_address[1]
-    url = f"http://127.0.0.1:{port}/"
+    try:
+        server = create_html_server(payload_now, port)
+    except OSError as e:
+        print(f"llm-usage: cannot bind 127.0.0.1:{port} ({e.strerror or e})"
+              " — is another llm-usage --html already running?"
+              " Choose a different port with --port <n>.",
+              file=sys.stderr)
+        return 2
+    bound_port = server.server_address[1]
+    url = f"http://127.0.0.1:{bound_port}/"
     # Flush immediately: with stdout piped or captured, the URL must not sit
     # in a block buffer for the lifetime of the server.
     print(f"llm-usage dashboard: {url}  (Ctrl-C to stop)", flush=True)
@@ -2936,14 +2955,35 @@ def parse_html_flags(args: list[str]
     return html, static_path, error
 
 
+def parse_port_flag(args: list[str]) -> tuple[int | None, str | None]:
+    """Return (port, error) for --port; port is None when the flag is absent."""
+    if "--port" not in args:
+        return None, None
+    idx = args.index("--port")
+    if idx + 1 >= len(args):
+        return None, "--port requires a port number"
+    raw = args[idx + 1]
+    try:
+        port = int(raw)
+    except ValueError:
+        return None, f"--port requires a port number, got {raw!r}"
+    if not 1 <= port <= 65535:
+        return None, f"--port must be between 1 and 65535, got {port}"
+    return port, None
+
+
 def main() -> None:
     args = sys.argv[1:]
     fresh = parse_cache_flags(args)
     tui = "--tui" in args
     json_mode = "--json" in args
     html, html_static, html_error = parse_html_flags(args)
-    if html_error:
-        print(f"llm-usage: {html_error}", file=sys.stderr)
+    port, port_error = parse_port_flag(args)
+    if html_error or port_error:
+        print(f"llm-usage: {html_error or port_error}", file=sys.stderr)
+        sys.exit(2)
+    if port is not None and not html:
+        print("llm-usage: --port requires --html", file=sys.stderr)
         sys.exit(2)
     if sum([tui, json_mode, html, html_static is not None]) > 1:
         print("llm-usage: choose at most one of "
@@ -2955,7 +2995,8 @@ def main() -> None:
     if html_static is not None:
         sys.exit(write_html_static(html_static, fresh))
     if html:
-        sys.exit(run_html_server(fresh))
+        sys.exit(run_html_server(
+            fresh, DEFAULT_HTML_PORT if port is None else port))
     if tui:
         if not sys.stdout.isatty():
             print("llm-usage: --tui requires an interactive terminal",
