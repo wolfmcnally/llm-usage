@@ -2006,8 +2006,8 @@ html{color-scheme:light dark}
 }
 @media (prefers-color-scheme: dark){
   :root{
-    --page:#0d0d0d; --card:#1a1a19; --ink:#ffffff; --ink2:#c3c2b7;
-    --muted:#898781; --hairline:#2c2c2a; --border:rgba(255,255,255,.10);
+    --page:#0d0d0d; --card:#1a1a19; --ink:#ffffff; --ink2:#cdcabf;
+    --muted:#a6a49c; --hairline:#2c2c2a; --border:rgba(255,255,255,.10);
     --trackbg:#262624;
     --under:#0ca30c;
     --lead:rgba(12,163,12,.25); --deficit:rgba(208,59,59,.30);
