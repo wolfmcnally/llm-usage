@@ -19,11 +19,29 @@ echo $?              # 0 = both OK, 1 = one provider failed, 2 = both failed
 ./llm-usage --fresh   # bypass the cache for this run, hit the APIs live
 ./llm-usage --json     # machine-readable snapshot (also cached)
 ./llm-usage --tui      # interactive curses view with resize + vertical scroll
+./llm-usage --html     # loopback-server browser dashboard, opens preferred browser
+./llm-usage --html-static <path>  # write one self-contained snapshot page
 ```
 
 `--tui` requires an interactive terminal and exits 2 when stdout is not a TTY.
-`--tui --json` is invalid and exits 2. In TUI mode, `--fresh` bypasses cache
-reads only for the initial data load; subsequent refreshes are cache-aware.
+`--tui`, `--json`, `--html`, and `--html-static` are mutually exclusive; any
+combination exits 2, as does `--html-static` without a path. In TUI mode,
+`--fresh` bypasses cache reads only for the initial data load; subsequent
+refreshes are cache-aware — `--html` treats `--fresh` the same way (initial
+payload only).
+
+`--html` binds an ephemeral port on 127.0.0.1, prints the URL (flushed), opens
+it via `webbrowser`, and serves `/` (page with embedded payload) plus
+`/data.json` until Ctrl-C (exit 0). Every payload is produced by running
+`llm-usage --json` as a subprocess, so the HTML surface shares the exact
+source of truth and cache/backoff behavior of the JSON path — never fetch
+provider data for HTML any other way. The page re-renders locally every
+second and polls `/data.json` every `HTML_POLL_SECONDS` (60); it suppresses
+Codex Spark like the TUI, follows `prefers-color-scheme`, and is display-only
+(no interactivity). `--html-static <path>` writes the same page with the
+payload embedded and polling disabled, prints the absolute path, and exits
+with the usual 0/1/2 provider codes. Embedded JSON escapes `</` so provider
+strings can never close the script element.
 
 TUI controls: `↑`/`k`, `↓`/`j`, `PageUp`, `PageDown`, `Home`, `End`, mouse wheel
 when supported, and `q`/`Esc`/`Ctrl-C` to quit. The TUI refetches data when

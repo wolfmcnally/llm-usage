@@ -40,6 +40,16 @@ inline error line in that section while the other still renders fully.
 
 Exit codes: 0 = both providers OK, 1 = one provider failed, 2 = both failed.
 
+Output modes (choose at most one): the default one-shot ANSI render, --json
+(machine-readable snapshot), --tui (interactive curses view), --html (serves a
+display-only browser dashboard on 127.0.0.1, opens it in the preferred
+browser, and keeps updating it — via `llm-usage --json` subprocess calls, so
+the same cache and backoff apply — until this invocation is terminated; exits
+0 on Ctrl-C), and --html-static <path> (writes one self-contained snapshot
+page to <path> for agents to open or screenshot; exits with the usual 0/1/2
+provider codes). The HTML surface follows the system light/dark mode and is
+read-only, with no interactive controls.
+
 Caching: each successful API response is cached on disk per provider, and a
 subsequent run within the TTL is served from that cache without touching the
 network — so the real endpoints are hit at most once per success window no
@@ -86,6 +96,8 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timezone
 from typing import Any
 
@@ -1841,6 +1853,7 @@ def _anthropic_json(service_status_snapshot: dict | None = None) -> dict:
         err = "rate limited (429)" if code == 429 else f"API error {code}"
         return {"ok": False, "error": err, "windows": {},
                 "rate_limited": code == 429,
+                "oauth_expires_at_ms": tok.get("expires_at_ms"),
                 "cached": age is not None, "cache_age_seconds": age,
                 "service_status": service_status}
     now = datetime.now(timezone.utc)
@@ -1849,9 +1862,11 @@ def _anthropic_json(service_status_snapshot: dict | None = None) -> dict:
         reset_dt = parse_iso(band.get("resets_at"))
         rem = (reset_dt - now).total_seconds() if reset_dt else None
         windows[band["key"]] = {
+            "label": band["label"],
             "utilization": band["utilization"],
             "resets_at": band.get("resets_at"),
             "reset_seconds": rem,
+            "window_seconds": band["window_seconds"],
             "kind": band.get("kind"),
             "group": band.get("group"),
             "is_active": band.get("is_active"),
@@ -1861,6 +1876,7 @@ def _anthropic_json(service_status_snapshot: dict | None = None) -> dict:
     return {"ok": True, "error": None,
             "subscription": tok.get("subscription"), "windows": windows,
             "usage_credits": normalize_anthropic_spend(a),
+            "oauth_expires_at_ms": tok.get("expires_at_ms"),
             "cached": age is not None, "cache_age_seconds": age,
             "service_status": service_status}
 
@@ -1880,6 +1896,7 @@ def _openai_json(service_status_snapshot: dict | None = None) -> dict:
         err = "rate limited (429)" if code == 429 else f"API error {code}"
         return {"ok": False, "error": err, "windows": {},
                 "rate_limited": code == 429,
+                "oauth_expires_at_ms": tok.get("expires_at_ms"),
                 "cached": age is not None, "cache_age_seconds": age,
                 "service_status": service_status}
     rl = o.get("rate_limit") or {}
@@ -1893,6 +1910,7 @@ def _openai_json(service_status_snapshot: dict | None = None) -> dict:
             "utilization": float(w.get("used_percent", 0)),
             "reset_seconds": adjusted_openai_reset_seconds(snapshot, w),
             "reset_at": w.get("reset_at"),
+            "window_seconds": w.get("limit_window_seconds"),
         }
     additional = []
     for title, rate_limit, feature in openai_additional_rate_limits(o):
@@ -1905,6 +1923,7 @@ def _openai_json(service_status_snapshot: dict | None = None) -> dict:
                 "utilization": float(w.get("used_percent", 0)),
                 "reset_seconds": adjusted_openai_reset_seconds(snapshot, w),
                 "reset_at": w.get("reset_at"),
+                "window_seconds": w.get("limit_window_seconds"),
             }
         additional.append({
             "name": title,
@@ -1926,6 +1945,7 @@ def _openai_json(service_status_snapshot: dict | None = None) -> dict:
     }
     return {"ok": True, "error": None,
             "plan": o.get("plan_type"),
+            "oauth_expires_at_ms": tok.get("expires_at_ms"),
             "limit_reached": bool(rl.get("limit_reached")),
             "windows": windows,
             "additional_rate_limits": additional,
@@ -1946,6 +1966,647 @@ def emit_json() -> int:
     o = _openai_json()
     print(json.dumps({"anthropic": a, "openai": o}, indent=2))
     return 0 if (a["ok"] and o["ok"]) else (1 if (a["ok"] or o["ok"]) else 2)
+
+
+# ------------------------------------------------------------ html output ----
+#
+# `--html` serves a display-only browser dashboard from a loopback HTTP server
+# and opens it in the preferred browser; the page re-renders locally every
+# second (countdowns, pace tick) and polls /data.json every minute, which runs
+# `llm-usage --json` as a subprocess — so the HTML surface consumes exactly the
+# same cache-aware source of truth as every other consumer, and the endpoints
+# are still hit at most once per TTL window. `--html-static <path>` writes one
+# self-contained snapshot page (payload embedded, polling disabled) so an agent
+# can open it or screenshot it. Both are read-only surfaces with no controls.
+#
+# Visual language: each window row is the CLI's pace instrument translated —
+# a status-colored usage fill, a "now" tick at percent-of-window-elapsed, and
+# the interval between them painted as headroom (green) or overrun (red).
+# Colors follow the system light/dark mode via prefers-color-scheme.
+
+HTML_POLL_SECONDS = 60
+
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llm-usage</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect x='1' y='9' width='14' height='4' rx='2' fill='%230ca30c'/><path d='M11 3 L14 8 L8 8 Z' fill='%23d03b3b'/></svg>">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html{color-scheme:light dark}
+:root{
+  --page:#f9f9f7; --card:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e;
+  --muted:#898781; --hairline:#e1e0d9; --border:rgba(11,11,11,.10);
+  --trackbg:#eae9e2;
+  --good:#0ca30c; --warning:#fab219; --serious:#ec835a; --critical:#d03b3b;
+  --under:#006300; --over:#d03b3b;
+  --lead:rgba(12,163,12,.18); --deficit:rgba(208,59,59,.20);
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --page:#0d0d0d; --card:#1a1a19; --ink:#ffffff; --ink2:#c3c2b7;
+    --muted:#898781; --hairline:#2c2c2a; --border:rgba(255,255,255,.10);
+    --trackbg:#262624;
+    --under:#0ca30c;
+    --lead:rgba(12,163,12,.25); --deficit:rgba(208,59,59,.30);
+  }
+}
+body{
+  font:14px/1.5 ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,
+       "Liberation Mono",monospace;
+  background:var(--page); color:var(--ink);
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:1180px;margin:0 auto;padding:clamp(16px,3vw,40px)}
+header{display:flex;justify-content:space-between;align-items:baseline;
+  gap:10px 16px;flex-wrap:wrap;margin-bottom:22px}
+h1{font-size:clamp(20px,2.6vw,26px);font-weight:600;letter-spacing:.02em}
+.caret{color:var(--critical);animation:blink 1.2s steps(1) infinite}
+@keyframes blink{50%{opacity:0}}
+.tag{color:var(--muted);font-size:12px}
+.chip{font-size:12px;color:var(--ink2);border:1px solid var(--border);
+  border-radius:999px;padding:3px 11px;background:var(--card);
+  white-space:nowrap}
+.chip.offline{color:var(--critical);border-color:var(--critical)}
+main{display:grid;gap:18px;
+  grid-template-columns:repeat(auto-fit,minmax(min(460px,100%),1fr))}
+.card{background:var(--card);border:1px solid var(--border);
+  border-radius:12px;padding:18px 22px 16px;align-self:start}
+.card-head{display:flex;justify-content:space-between;align-items:baseline;
+  gap:6px 12px;flex-wrap:wrap;padding-bottom:10px;
+  border-bottom:1px solid var(--hairline);margin-bottom:4px}
+.p-name{font-size:12px;font-weight:700;letter-spacing:.16em}
+.p-plan{color:var(--ink2);font-size:12px;margin-left:8px}
+.head-notes{display:flex;gap:4px 12px;flex-wrap:wrap;font-size:11.5px}
+.n-dim{color:var(--muted)} .n-warn{color:var(--serious)}
+.n-crit{color:var(--critical)}
+.svc{font-size:12px;color:var(--ink2);padding:7px 0 3px;
+  display:flex;gap:7px;align-items:baseline}
+.dot{width:8px;height:8px;border-radius:50%;flex:none;
+  display:inline-block;transform:translateY(.5px)}
+.err{color:var(--critical);font-size:13px;padding:10px 0 6px}
+.empty{color:var(--muted);font-size:13px;padding:10px 0 6px}
+.group{margin:12px 0 -4px;font-size:12px;color:var(--muted);
+  display:flex;gap:4px 12px;flex-wrap:wrap;align-items:baseline}
+.badge{color:var(--critical);font-size:11.5px}
+.rowline{padding:11px 0 7px}
+.row-head{display:flex;justify-content:space-between;align-items:baseline;
+  gap:2px 12px;flex-wrap:wrap;font-size:12.5px;margin-bottom:7px}
+.row-label{font-weight:600}
+.row-meta{color:var(--muted);display:flex;gap:0 7px;flex-wrap:wrap;
+  font-variant-numeric:tabular-nums}
+.pace-under{color:var(--under)} .pace-over{color:var(--over)}
+.pace-on{color:var(--ink2)}
+.row-body{display:flex;align-items:center;gap:13px}
+.util{font-size:22px;font-weight:600;font-variant-numeric:tabular-nums;
+  min-width:3.4ch;text-align:right;letter-spacing:-.02em}
+.util .ovf{color:var(--critical);font-size:14px;font-weight:700}
+.track{position:relative;flex:1;height:12px}
+.track-clip{position:absolute;inset:0;border-radius:6px;overflow:hidden;
+  background:var(--trackbg)}
+.fill{position:absolute;top:0;bottom:0;left:0;border-radius:0 4px 4px 0}
+.fill.g{background:var(--good)} .fill.w{background:var(--warning)}
+.fill.s{background:var(--serious)} .fill.c{background:var(--critical)}
+.band{position:absolute;top:0;bottom:0}
+.band.lead{background:var(--lead)} .band.deficit{background:var(--deficit)}
+.tick{position:absolute;top:-3px;bottom:-3px;width:2px;
+  background:currentColor;transform:translateX(-1px)}
+.tick::before{content:"";position:absolute;top:-5px;left:-3px;
+  border:4px solid transparent;border-top:5px solid currentColor;
+  border-bottom:none}
+.extras{margin-top:12px;padding-top:10px;border-top:1px solid var(--hairline);
+  font-size:12px;color:var(--ink2);display:flex;flex-wrap:wrap;gap:2px 7px}
+.x-label{color:var(--muted)}
+.x-on{color:var(--under)}
+footer{margin-top:28px;color:var(--muted);font-size:12px;
+  display:flex;flex-direction:column;gap:9px}
+.legend{display:flex;gap:6px 16px;flex-wrap:wrap}
+.lg{display:inline-flex;gap:7px;align-items:center;white-space:nowrap}
+.sw{width:13px;height:9px;border-radius:2px;display:inline-block;flex:none}
+.sw-tick{width:2px;height:13px;border-radius:0;background:var(--ink2)}
+footer code{font:inherit;color:var(--ink2)}
+@media (max-width:520px){
+  .card{padding:14px 16px 12px}
+  .util{font-size:18px}
+}
+@media (prefers-reduced-motion: reduce){
+  *{animation:none!important;transition:none!important}
+}
+</style>
+</head>
+<body data-mode="__MODE__">
+<div class="wrap">
+  <header>
+    <div>
+      <h1>llm-usage<span class="caret">_</span></h1>
+      <p class="tag">subscription pace &middot; read-only</p>
+    </div>
+    <span id="mode-chip" class="chip"></span>
+  </header>
+  <main id="providers" aria-live="polite"></main>
+  <footer>
+    <div class="legend">
+      <span class="lg"><i class="sw" style="background:var(--good)"></i>&lt;50% used</span>
+      <span class="lg"><i class="sw" style="background:var(--warning)"></i>&ge;50%</span>
+      <span class="lg"><i class="sw" style="background:var(--serious)"></i>&ge;75%</span>
+      <span class="lg"><i class="sw" style="background:var(--critical)"></i>&ge;90%</span>
+      <span class="lg"><i class="sw sw-tick"></i>now (window elapsed)</span>
+      <span class="lg"><i class="sw" style="background:var(--lead)"></i>headroom</span>
+      <span class="lg"><i class="sw" style="background:var(--deficit)"></i>overrun</span>
+    </div>
+    <p>data via <code>llm-usage --json</code> &middot; purchases and toggles stay in the vendor apps</p>
+  </footer>
+</div>
+<script id="payload" type="application/json">__PAYLOAD_JSON__</script>
+<script>
+"use strict";
+const MODE = document.body.dataset.mode;
+const POLL_MS = __POLL_SECONDS__ * 1000;
+let data = JSON.parse(document.getElementById("payload").textContent);
+let receivedAt = Date.now();
+let offline = false;
+
+function elapsed() { return (Date.now() - receivedAt) / 1000; }
+function clamp(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
+
+function fmtRel(s) {
+  s = Math.max(0, Math.floor(s));
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (d) return d + "d " + h + "h";
+  if (h) return h + "h " + String(m).padStart(2, "0") + "m";
+  return m + "m";
+}
+
+function fmtAgo(s) { return s < 60 ? Math.floor(s) + "s" : fmtRel(s); }
+
+function windowLabel(ws, fallback) {
+  if (!ws || typeof ws !== "number") return fallback;
+  if (ws % 86400 === 0 && ws >= 86400) return (ws / 86400) + "-day";
+  if (ws % 3600 === 0) return (ws / 3600) + "-hour";
+  return ws + "s";
+}
+
+function h(tag, cls, ...kids) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  for (const k of kids) {
+    if (k === null || k === undefined) continue;
+    e.appendChild(typeof k === "string" ? document.createTextNode(k) : k);
+  }
+  return e;
+}
+
+function sevClass(pct) {
+  if (pct < 50) return "g";
+  if (pct < 75) return "w";
+  if (pct < 90) return "s";
+  return "c";
+}
+
+function titleCase(s) {
+  return String(s).replace(/\\b[a-z]/g, ch => ch.toUpperCase());
+}
+
+function money(m) {
+  if (!m || typeof m.amount !== "number") return null;
+  const sym = ({USD: "$", EUR: "\\u20ac", GBP: "\\u00a3"})[m.currency];
+  const digits = Math.min(typeof m.exponent === "number" ? m.exponent : 2, 4);
+  const n = m.amount.toLocaleString(undefined,
+    {minimumFractionDigits: digits, maximumFractionDigits: digits});
+  return sym ? sym + n : (n + " " + (m.currency || "")).trim();
+}
+
+function metaSegs(...segs) {
+  const out = [];
+  for (const seg of segs) {
+    if (!seg) continue;
+    if (out.length) out.push(h("span", null, "\\u00b7"));
+    out.push(seg);
+  }
+  return out;
+}
+
+function rowEl(it) {
+  const util = Math.max(0, Number(it.util) || 0);
+  const rem = it.rs !== null && it.rs !== undefined
+    ? Math.max(0, it.rs - elapsed()) : null;
+  const nowPct = it.ws && rem !== null
+    ? clamp((it.ws - rem) / it.ws * 100, 0, 100) : null;
+  const fillPct = Math.min(util, 100);
+
+  const clip = h("div", "track-clip");
+  const fill = h("div", "fill " + sevClass(util));
+  fill.style.width = fillPct + "%";
+  clip.appendChild(fill);
+
+  let paceCls = "pace-on";
+  let paceSeg = null;
+  let nowSeg = null;
+  if (nowPct !== null) {
+    const margin = util - nowPct;
+    if (util >= nowPct + 5) paceCls = "pace-over";
+    else if (util <= nowPct - 5) paceCls = "pace-under";
+    const signed = (margin >= 0 ? "+" : "\\u2212") +
+      Math.abs(margin).toFixed(0) + "pp";
+    if (paceCls === "pace-over") {
+      paceSeg = h("span", paceCls, "\\u2191 " + signed + " over pace");
+      const left = Math.min(nowPct, fillPct);
+      const band = h("div", "band deficit");
+      band.style.left = left + "%";
+      band.style.width = (fillPct - left) + "%";
+      clip.appendChild(band);
+    } else if (paceCls === "pace-under") {
+      paceSeg = h("span", paceCls, "\\u2193 " + signed + " under pace");
+      const band = h("div", "band lead");
+      band.style.left = fillPct + "%";
+      band.style.width = (nowPct - fillPct) + "%";
+      clip.appendChild(band);
+    } else {
+      paceSeg = h("span", paceCls, "\\u2248 on pace");
+    }
+    nowSeg = h("span", null, "now " + nowPct.toFixed(0) + "%");
+  }
+
+  const track = h("div", "track", clip);
+  if (nowPct !== null) {
+    const tick = h("div", "tick " + paceCls);
+    tick.style.left = nowPct + "%";
+    track.appendChild(tick);
+  }
+
+  const utilEl = h("span", "util", util.toFixed(0) + "%");
+  if (util > 100) utilEl.appendChild(h("span", "ovf", "\\u2191"));
+  const resetSeg = rem !== null
+    ? h("span", null, "resets in " + fmtRel(rem)) : null;
+  return h("div", "rowline",
+    h("div", "row-head",
+      h("span", "row-label", it.label),
+      h("span", "row-meta", ...metaSegs(nowSeg, paceSeg, resetSeg))),
+    h("div", "row-body", utilEl, track));
+}
+
+function notices(p) {
+  const out = [];
+  if (p.rate_limited) {
+    out.push(h("span", "n-warn", "\\u25cf rate limited (429)"));
+  } else if (p.cached && p.cache_age_seconds !== null
+             && p.cache_age_seconds !== undefined) {
+    out.push(h("span", "n-dim",
+      "\\u21bb cached " + fmtRel(p.cache_age_seconds + elapsed()) + " ago"));
+  }
+  const exp = p.oauth_expires_at_ms;
+  if (exp !== null && exp !== undefined) {
+    const s = exp / 1000 - Date.now() / 1000;
+    if (s <= 0) {
+      out.push(h("span", "n-crit",
+        "\\u2716 OAuth expired " + fmtRel(-s) + " ago"));
+    } else if (s <= 4 * 3600) {
+      out.push(h("span", s < 3600 ? "n-crit" : "n-warn",
+        "\\u26a0 OAuth expires in " + fmtRel(s)));
+    }
+  }
+  return out;
+}
+
+function serviceLine(ss) {
+  if (!ss) return null;
+  const dot = color => {
+    const d = h("span", "dot");
+    d.style.background = color;
+    return d;
+  };
+  if (!ss.available) {
+    if (!ss.error) return null;
+    return h("div", "svc", dot("var(--serious)"),
+      h("span", null, "service status unavailable (" + ss.error + ")"));
+  }
+  if (ss.operational && !ss.stale) return null;
+  const confirmed = ss.stale
+    ? " \\u00b7 last confirmed " + (
+        typeof ss.cache_age_seconds === "number"
+          ? fmtRel(ss.cache_age_seconds + elapsed()) + " ago" : "earlier")
+    : "";
+  if (ss.operational) {
+    return h("div", "svc", dot("var(--serious)"),
+      h("span", null, "status unavailable; last known: "
+        + ss.description + confirmed));
+  }
+  const color = ss.indicator === "major" || ss.indicator === "critical"
+    ? "var(--critical)"
+    : ss.indicator === "minor" ? "var(--serious)" : "var(--warning)";
+  return h("div", "svc", dot(color),
+    h("span", null, (ss.description || "Service disruption") + confirmed));
+}
+
+function extrasEl(parts) {
+  if (!parts.length) return null;
+  return h("div", "extras", h("span", "x-label", "extras"),
+    ...metaSegs(...parts));
+}
+
+function anthRows(p) {
+  return Object.entries(p.windows || {}).map(([key, w]) => ({
+    label: w.label || key,
+    util: w.utilization,
+    rs: w.reset_seconds,
+    ws: w.window_seconds,
+  }));
+}
+
+function anthExtras(p) {
+  const uc = p.usage_credits;
+  if (!uc) return null;
+  const used = uc.used && typeof uc.used.amount === "number"
+    ? uc.used.amount : 0;
+  const actionable = uc.severity && uc.severity !== "normal";
+  if (!(uc.enabled || used > 0 || actionable)) return null;
+  const parts = [h("span", uc.enabled ? "x-on" : null,
+    "usage credits " + (uc.enabled ? "on" : "off"))];
+  const u = money(uc.used), l = money(uc.limit);
+  if (u && l) parts.push(h("span", null, u + " / " + l));
+  const reason = uc.disabled_reason;
+  if (reason && reason !== "disabled" && reason !== "not_enabled") {
+    parts.push(h("span", "n-warn", String(reason).replace(/_/g, " ")));
+  }
+  if (actionable) {
+    parts.push(h("span", "n-warn", String(uc.severity).replace(/_/g, " ")));
+  }
+  return extrasEl(parts);
+}
+
+function isSpark(group) {
+  if (group.metered_feature === "codex_bengalfox") return true;
+  const slug = String(group.name || "")
+    .toLowerCase().replace(/[^a-z0-9]+/g, "-");
+  return slug.indexOf("codex-spark") !== -1;
+}
+
+function winRow(key, w) {
+  return {
+    label: windowLabel(w.window_seconds,
+      key === "primary_window" ? "session" : "weekly"),
+    util: w.utilization,
+    rs: w.reset_seconds,
+    ws: w.window_seconds,
+  };
+}
+
+function oaRows(p) {
+  const out = Object.entries(p.windows || {})
+    .map(([key, w]) => winRow(key, w));
+  for (const group of p.additional_rate_limits || []) {
+    if (isSpark(group)) continue;
+    const rows = Object.entries(group.windows || {})
+      .map(([key, w]) => winRow(key, w));
+    if (!rows.length) continue;
+    const badges = [];
+    if (group.limit_reached) {
+      badges.push(h("span", "badge", "\\u25cf limit reached"));
+    } else if (group.allowed === false) {
+      badges.push(h("span", "badge", "\\u26a0 not currently allowed"));
+    }
+    out.push({group: true, name: group.name, badges: badges});
+    out.push(...rows);
+  }
+  return out;
+}
+
+function oaExtras(p) {
+  const parts = [];
+  const credits = p.credits || {};
+  if (credits.unlimited) {
+    parts.push(h("span", "x-on", "credits unlimited"));
+  } else if (credits.overage_limit_reached) {
+    parts.push(h("span", "n-crit", "credit limit reached"));
+  } else if (credits.has_credits) {
+    const balance = credits.balance;
+    parts.push(h("span", "x-on",
+      balance !== null && balance !== undefined && balance !== ""
+        ? "credit balance " + balance : "credits available"));
+  }
+  const rc = p.rate_limit_reset_credits || {};
+  const count = rc.available_count || 0;
+  if (count > 0) {
+    parts.push(h("span", "x-on",
+      count + " usage " + (count === 1 ? "reset" : "resets")));
+    if (typeof rc.next_expires_in_seconds === "number") {
+      const rem = Math.max(0, rc.next_expires_in_seconds - elapsed());
+      const cls = rem <= 4 * 3600 ? "n-crit"
+        : rem <= 24 * 3600 ? "n-warn" : null;
+      const when = rem <= 3 * 86400
+        ? "in " + fmtRel(rem)
+        : new Date((rc.next_expires_at || 0) * 1000).toLocaleString(
+            undefined, {weekday: "short", month: "short", day: "numeric",
+                        hour: "2-digit", minute: "2-digit"});
+      parts.push(h("span", cls, "next expires " + when));
+    }
+  }
+  return extrasEl(parts);
+}
+
+function card(name, plan, p, rows, extras) {
+  const nameEl = h("div", null, h("span", "p-name", name));
+  if (plan) nameEl.appendChild(h("span", "p-plan", plan));
+  const c = h("section", "card",
+    h("div", "card-head", nameEl, h("div", "head-notes", ...notices(p))));
+  const svc = serviceLine(p.service_status);
+  if (svc) c.appendChild(svc);
+  if (!p.ok) {
+    c.appendChild(h("div", "err", "\\u2716 " + (p.error || "unavailable")));
+    return c;
+  }
+  if (p.limit_reached) {
+    c.appendChild(h("div", "err",
+      "\\u25cf limit reached \\u2014 requests will be rejected"));
+  }
+  let printed = 0;
+  for (const it of rows) {
+    if (it.group) {
+      c.appendChild(h("div", "group",
+        h("span", null, it.name), ...it.badges));
+    } else {
+      c.appendChild(rowEl(it));
+      printed++;
+    }
+  }
+  if (!printed) c.appendChild(h("div", "empty", "(no usage data)"));
+  if (extras) c.appendChild(extras);
+  return c;
+}
+
+function chipEl() {
+  const el = document.getElementById("mode-chip");
+  el.classList.toggle("offline", offline);
+  if (MODE === "static") {
+    const when = typeof data.generated_at === "number"
+      ? new Date(data.generated_at * 1000).toLocaleString() : "";
+    el.textContent = "static snapshot" + (when ? " \\u00b7 " + when : "");
+  } else if (offline) {
+    el.textContent = "\\u25cf source offline \\u00b7 data "
+      + fmtAgo(elapsed()) + " old";
+  } else {
+    el.textContent = "live \\u00b7 updated " + fmtAgo(elapsed()) + " ago";
+  }
+}
+
+function render() {
+  const a = data.anthropic || {ok: false, error: "missing provider data"};
+  const o = data.openai || {ok: false, error: "missing provider data"};
+  const aPlan = a.subscription
+    ? "Claude " + titleCase(a.subscription) + " plan" : "Claude";
+  const oPlan = o.plan
+    ? "ChatGPT " + titleCase(o.plan) + " plan" : "ChatGPT";
+  const root = document.getElementById("providers");
+  root.textContent = "";
+  root.appendChild(card("ANTHROPIC", aPlan, a, anthRows(a), anthExtras(a)));
+  root.appendChild(card("OPENAI", oPlan, o, oaRows(o), oaExtras(o)));
+  chipEl();
+}
+
+if (MODE === "live") {
+  setInterval(async () => {
+    try {
+      const response = await fetch("data.json", {cache: "no-store"});
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      data = await response.json();
+      receivedAt = Date.now();
+      offline = false;
+    } catch (e) {
+      offline = true;
+    }
+    render();
+  }, POLL_MS);
+}
+setInterval(render, 1000);
+render();
+</script>
+</body>
+</html>
+"""
+
+
+def usage_payload(fresh: bool = False) -> dict:
+    """Collect the `--json` snapshot by invoking this executable.
+
+    Running the CLI as a subprocess keeps the HTML surface on exactly the same
+    source of truth as every other `--json` consumer, including its cache and
+    backoff behavior, so a polling page can never hit the provider endpoints
+    more often than the CLI itself would.
+    """
+    cmd = [sys.executable, os.path.realpath(__file__), "--json"]
+    if fresh:
+        cmd.append("--fresh")
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=120)
+        payload = json.loads(proc.stdout)
+        if not isinstance(payload, dict):
+            raise ValueError("non-object payload")
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        error = f"usage snapshot failed: {e}"
+        payload = {
+            "anthropic": {"ok": False, "error": error, "windows": {}},
+            "openai": {"ok": False, "error": error, "windows": {}},
+        }
+    payload["generated_at"] = time.time()
+    return payload
+
+
+def payload_exit_code(payload: dict) -> int:
+    a = payload.get("anthropic") or {}
+    o = payload.get("openai") or {}
+    return dashboard_exit_code(bool(a.get("ok")), bool(o.get("ok")))
+
+
+def build_html_page(payload: dict, mode: str) -> str:
+    # "</" must not appear literally inside the inline JSON script element.
+    doc = json.dumps(payload).replace("</", "<\\/")
+    return (HTML_TEMPLATE
+            .replace("__MODE__", mode)
+            .replace("__POLL_SECONDS__", str(HTML_POLL_SECONDS))
+            .replace("__PAYLOAD_JSON__", doc))
+
+
+def write_html_static(file_path: str, fresh: bool) -> int:
+    payload = usage_payload(fresh)
+    page = build_html_page(payload, "static")
+    out_path = os.path.abspath(os.path.expanduser(file_path))
+    parent = os.path.dirname(out_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(page)
+    print(out_path)
+    return payload_exit_code(payload)
+
+
+def create_html_server(payload_fn) -> ThreadingHTTPServer:
+    """Loopback HTTP server for the live dashboard: / and /data.json."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 — BaseHTTPRequestHandler API
+            request_path = self.path.split("?", 1)[0]
+            if request_path == "/":
+                body = build_html_page(payload_fn(), "live").encode("utf-8")
+                content_type = "text/html; charset=utf-8"
+                status = 200
+            elif request_path == "/data.json":
+                body = json.dumps(payload_fn()).encode("utf-8")
+                content_type = "application/json"
+                status = 200
+            elif request_path == "/favicon.ico":
+                self.send_response(204)
+                self.end_headers()
+                return
+            else:
+                body = b"not found"
+                content_type = "text/plain; charset=utf-8"
+                status = 404
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+            except OSError:
+                pass  # client went away mid-response; never fatal
+
+        def log_message(self, *_args):
+            pass  # keep the terminal quiet; the page is the output
+
+    return ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+
+
+def run_html_server(fresh: bool) -> int:
+    lock = threading.Lock()
+    state = {"fresh": fresh}
+
+    def payload_now() -> dict:
+        with lock:
+            use_fresh = state["fresh"]
+            state["fresh"] = False
+            return usage_payload(use_fresh)
+
+    server = create_html_server(payload_now)
+    port = server.server_address[1]
+    url = f"http://127.0.0.1:{port}/"
+    # Flush immediately: with stdout piped or captured, the URL must not sit
+    # in a block buffer for the lifetime of the server.
+    print(f"llm-usage dashboard: {url}  (Ctrl-C to stop)", flush=True)
+    threading.Thread(target=webbrowser.open, args=(url,),
+                     daemon=True).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
 
 
 # ------------------------------------------------------------ dashboard ----
@@ -2260,17 +2921,41 @@ def run_tui(initial_fresh: bool) -> int:
         return 130
 
 
+def parse_html_flags(args: list[str]
+                     ) -> tuple[bool, str | None, str | None]:
+    """Return (html, html_static_path, error) from the argument list."""
+    html = "--html" in args
+    static_path = None
+    error = None
+    if "--html-static" in args:
+        idx = args.index("--html-static")
+        if idx + 1 >= len(args) or args[idx + 1].startswith("--"):
+            error = "--html-static requires an output path"
+        else:
+            static_path = args[idx + 1]
+    return html, static_path, error
+
+
 def main() -> None:
     args = sys.argv[1:]
     fresh = parse_cache_flags(args)
     tui = "--tui" in args
     json_mode = "--json" in args
-    if tui and json_mode:
-        print("llm-usage: --tui cannot be combined with --json",
+    html, html_static, html_error = parse_html_flags(args)
+    if html_error:
+        print(f"llm-usage: {html_error}", file=sys.stderr)
+        sys.exit(2)
+    if sum([tui, json_mode, html, html_static is not None]) > 1:
+        print("llm-usage: choose at most one of "
+              "--tui, --json, --html, --html-static",
               file=sys.stderr)
         sys.exit(2)
     if json_mode:
         sys.exit(emit_json())
+    if html_static is not None:
+        sys.exit(write_html_static(html_static, fresh))
+    if html:
+        sys.exit(run_html_server(fresh))
     if tui:
         if not sys.stdout.isatty():
             print("llm-usage: --tui requires an interactive terminal",

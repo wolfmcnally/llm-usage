@@ -1,6 +1,9 @@
 import importlib.machinery
 import importlib.util
 import json
+import threading
+import urllib.error
+import urllib.request
 from pathlib import Path
 import unittest
 from unittest import mock
@@ -239,6 +242,11 @@ class OpenAIUsageTests(unittest.TestCase):
             result["windows"]["primary_window"]["reset_seconds"],
             14280.0,
         )
+        self.assertEqual(
+            result["windows"]["primary_window"]["window_seconds"], 18000)
+        self.assertEqual(
+            result["windows"]["secondary_window"]["window_seconds"], 604800)
+        self.assertIn("oauth_expires_at_ms", result)
         self.assertEqual(result["credits"]["balance"], "42.5")
         self.assertEqual(
             result["rate_limit_reset_credits"]["available_count"], 2)
@@ -255,6 +263,8 @@ class OpenAIUsageTests(unittest.TestCase):
         self.assertEqual(extra["metered_feature"], "codex_bengalfox")
         self.assertEqual(
             extra["windows"]["secondary_window"]["utilization"], 7.0)
+        self.assertEqual(
+            extra["windows"]["secondary_window"]["window_seconds"], 604800)
 
     def test_reset_credit_detail_rows_are_a_forward_compatible_fallback(self):
         body = {
@@ -495,12 +505,123 @@ class AnthropicUsageTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["windows"]["seven_day"]["utilization"], 40.0)
+        self.assertEqual(
+            result["windows"]["seven_day"]["label"], "7-day overall")
+        self.assertEqual(
+            result["windows"]["seven_day"]["window_seconds"], 7 * 86400)
+        self.assertEqual(
+            result["windows"]["five_hour"]["window_seconds"], 5 * 3600)
+        self.assertIn("oauth_expires_at_ms", result)
         scoped = result["windows"]["seven_day_fable"]
         self.assertEqual(scoped["kind"], "weekly_scoped")
         self.assertEqual(scoped["severity"], "warning")
         self.assertEqual(result["usage_credits"]["source"], "spend")
         self.assertTrue(result["service_status"]["operational"])
         self.assertEqual(result["usage_credits"]["used"]["amount"], 12.34)
+
+
+class HtmlOutputTests(unittest.TestCase):
+    PAYLOAD = {
+        "anthropic": {"ok": True, "windows": {}},
+        "openai": {"ok": True, "windows": {}},
+        "generated_at": 1000.0,
+    }
+
+    def test_build_html_page_embeds_payload_mode_and_poll_interval(self):
+        payload = {
+            "anthropic": {"ok": False,
+                          "error": "</script><script>alert(1)",
+                          "windows": {}},
+            "openai": {"ok": True, "windows": {}},
+            "generated_at": 1000.0,
+        }
+        page = llm_usage.build_html_page(payload, "static")
+        self.assertIn('data-mode="static"', page)
+        self.assertIn('"generated_at": 1000.0', page)
+        self.assertIn("<\\/script><script>alert(1)", page)
+        self.assertNotIn("</script><script>alert(1)", page)
+        live = llm_usage.build_html_page(payload, "live")
+        self.assertIn('data-mode="live"', live)
+        self.assertIn(
+            f"const POLL_MS = {llm_usage.HTML_POLL_SECONDS} * 1000", live)
+
+    def test_usage_payload_runs_cli_json_and_honors_fresh(self):
+        completed = mock.Mock(
+            stdout=json.dumps({"anthropic": {"ok": True},
+                               "openai": {"ok": False}}),
+            returncode=1)
+        with mock.patch.object(llm_usage.subprocess, "run",
+                               return_value=completed) as run:
+            payload = llm_usage.usage_payload(fresh=True)
+        cmd = run.call_args.args[0]
+        self.assertEqual(cmd[2:], ["--json", "--fresh"])
+        self.assertTrue(payload["anthropic"]["ok"])
+        self.assertIn("generated_at", payload)
+        self.assertEqual(llm_usage.payload_exit_code(payload), 1)
+
+        with mock.patch.object(llm_usage.subprocess, "run",
+                               return_value=completed) as run:
+            llm_usage.usage_payload()
+        self.assertNotIn("--fresh", run.call_args.args[0])
+
+    def test_usage_payload_failure_degrades_both_providers(self):
+        with mock.patch.object(llm_usage.subprocess, "run",
+                               side_effect=OSError("no interpreter")):
+            payload = llm_usage.usage_payload()
+        self.assertFalse(payload["anthropic"]["ok"])
+        self.assertFalse(payload["openai"]["ok"])
+        self.assertIn("usage snapshot failed", payload["openai"]["error"])
+        self.assertIn("generated_at", payload)
+        self.assertEqual(llm_usage.payload_exit_code(payload), 2)
+
+    def test_parse_html_flags(self):
+        self.assertEqual(llm_usage.parse_html_flags(["--html"]),
+                         (True, None, None))
+        self.assertEqual(
+            llm_usage.parse_html_flags(["--html-static", "out.html"]),
+            (False, "out.html", None))
+        _html, static_path, error = llm_usage.parse_html_flags(
+            ["--html-static"])
+        self.assertIsNone(static_path)
+        self.assertIn("output path", error)
+        _html, static_path, error = llm_usage.parse_html_flags(
+            ["--html-static", "--fresh"])
+        self.assertIsNone(static_path)
+        self.assertIn("output path", error)
+
+    def test_write_html_static_writes_snapshot_page(self):
+        import tempfile
+        with mock.patch.object(llm_usage, "usage_payload",
+                               return_value=dict(self.PAYLOAD)):
+            with tempfile.TemporaryDirectory() as tmp:
+                out = Path(tmp) / "nested" / "usage.html"
+                with mock.patch("sys.stdout"):
+                    exit_code = llm_usage.write_html_static(str(out), False)
+                page = out.read_text()
+        self.assertEqual(exit_code, 0)
+        self.assertIn('data-mode="static"', page)
+        self.assertIn('"generated_at"', page)
+
+    def test_html_server_serves_dashboard_and_data(self):
+        server = llm_usage.create_html_server(lambda: dict(self.PAYLOAD))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        try:
+            with urllib.request.urlopen(base + "/", timeout=5) as r:
+                page = r.read().decode()
+            self.assertIn('data-mode="live"', page)
+            self.assertIn("llm-usage", page)
+            with urllib.request.urlopen(base + "/data.json", timeout=5) as r:
+                data = json.loads(r.read().decode())
+            self.assertTrue(data["anthropic"]["ok"])
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(base + "/other", timeout=5)
+            self.assertEqual(ctx.exception.code, 404)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
 
 
 if __name__ == "__main__":

@@ -111,10 +111,46 @@ ages stay current without extra API calls.
 `--fresh` works with `--tui` as an initial cache-read bypass only, then the TUI
 returns to normal cache-aware refresh behavior.
 
+## HTML dashboard
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/html-dashboard-dark.png">
+  <img alt="The llm-usage HTML dashboard: two provider cards with status-colored usage bars, a now tick on each bar, and green headroom / red overrun bands between them" src="docs/html-dashboard-light.png">
+</picture>
+
+`llm-usage --html` serves a display-only browser dashboard from a loopback HTTP
+server and opens it in your preferred browser. Each limit window is the CLI's
+pace instrument translated to the page: a status-colored usage fill, a thin
+"now" tick at the percent-of-window-elapsed position, and the interval between
+them painted as green headroom or red overrun. The page follows the system
+light/dark color mode, adapts from phone-narrow to wide windows, and has no
+interactive controls.
+
+The page re-renders locally every second (countdowns, tick creep, cache ages)
+and polls the server every 60 seconds. Each poll runs `llm-usage --json` as a
+subprocess, so the page consumes exactly the same cache-aware source of truth
+as every other consumer — the provider endpoints are still hit at most once
+per TTL window no matter how long the page stays open. `--fresh` applies to
+the initial load only. The server runs until you stop the original invocation
+with `Ctrl-C` (exit `0`); if the page loses its server it shows a
+`source offline` chip and keeps displaying the last data.
+
+`llm-usage --html-static <path>` instead writes one self-contained snapshot
+page (payload embedded, no polling) to `<path>` and prints the absolute path —
+useful for agents that want to open or screenshot the dashboard. Its exit code
+follows the usual `0/1/2` provider semantics.
+
+`--tui`, `--json`, `--html`, and `--html-static` are mutually exclusive;
+combining them exits with code `2`.
+
 ## JSON output
 
 `llm-usage --json` emits normalized provider windows for scripts and schedulers.
-The Anthropic object also includes normalized `usage_credits` and limit metadata
+Every window carries `utilization` plus reset timing, and — where known — its
+`window_seconds` length so consumers can compute pace; Anthropic windows also
+carry a display `label`, and each provider object reports `oauth_expires_at_ms`
+for the credential it used. The Anthropic object also includes normalized
+`usage_credits` and limit metadata
 such as `kind`, `is_active`, and `severity`. The OpenAI object includes
 `additional_rate_limits`, `credits`, and `rate_limit_reset_credits`. Reset-credit
 output includes `details_complete`, `next_expires_at`, and
