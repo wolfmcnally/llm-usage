@@ -604,11 +604,16 @@ class HtmlOutputTests(unittest.TestCase):
     def test_run_html_server_fails_hard_when_port_is_taken(self):
         blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            blocker.bind(("127.0.0.1", 0))
+            # Match the server's wildcard address; a loopback-only listener
+            # can coexist with a wildcard listener on some platforms.
+            blocker.bind(("0.0.0.0", 0))
             blocker.listen(1)
             taken_port = blocker.getsockname()[1]
             with mock.patch.object(llm_usage.webbrowser, "open") as opened, \
-                    mock.patch.object(llm_usage.sys, "stderr"):
+                    mock.patch.object(llm_usage.sys, "stderr"), \
+                    mock.patch.object(llm_usage.ThreadingHTTPServer,
+                                      "serve_forever",
+                                      side_effect=AssertionError("unexpected bind success")):
                 exit_code = llm_usage.run_html_server(False, port=taken_port)
         finally:
             blocker.close()
@@ -635,6 +640,7 @@ class HtmlOutputTests(unittest.TestCase):
         thread.start()
         base = f"http://127.0.0.1:{server.server_address[1]}"
         try:
+            self.assertEqual(server.server_address[0], "0.0.0.0")
             with urllib.request.urlopen(base + "/", timeout=5) as r:
                 page = r.read().decode()
             self.assertIn('data-mode="live"', page)
@@ -645,6 +651,7 @@ class HtmlOutputTests(unittest.TestCase):
             with self.assertRaises(urllib.error.HTTPError) as ctx:
                 urllib.request.urlopen(base + "/other", timeout=5)
             self.assertEqual(ctx.exception.code, 404)
+            ctx.exception.close()
         finally:
             server.shutdown()
             server.server_close()

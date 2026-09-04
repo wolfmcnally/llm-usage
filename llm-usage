@@ -42,7 +42,8 @@ Exit codes: 0 = both providers OK, 1 = one provider failed, 2 = both failed.
 
 Output modes (choose at most one): the default one-shot ANSI render, --json
 (machine-readable snapshot), --tui (interactive curses view), --html (serves a
-display-only browser dashboard at http://127.0.0.1:17399/ — override with
+display-only browser dashboard on all IPv4 interfaces (local URL
+http://127.0.0.1:17399/) — override with
 --port <n>; a failed bind is a hard exit-2 error — opens it in the preferred
 browser, and keeps updating it — via `llm-usage --json` subprocess calls, so
 the same cache and backoff apply — until this invocation is terminated; exits
@@ -2554,7 +2555,7 @@ def write_html_static(file_path: str, fresh: bool) -> int:
 
 
 def create_html_server(payload_fn, port: int) -> ThreadingHTTPServer:
-    """Loopback HTTP server for the live dashboard: / and /data.json.
+    """HTTP server on all IPv4 interfaces for the live dashboard: / and /data.json.
 
     Raises OSError when the port cannot be bound; callers decide policy.
     """
@@ -2591,7 +2592,7 @@ def create_html_server(payload_fn, port: int) -> ThreadingHTTPServer:
         def log_message(self, *_args):
             pass  # keep the terminal quiet; the page is the output
 
-    return ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    return ThreadingHTTPServer(("0.0.0.0", port), Handler)
 
 
 def run_html_server(fresh: bool, port: int = DEFAULT_HTML_PORT) -> int:
@@ -2607,7 +2608,7 @@ def run_html_server(fresh: bool, port: int = DEFAULT_HTML_PORT) -> int:
     try:
         server = create_html_server(payload_now, port)
     except OSError as e:
-        print(f"llm-usage: cannot bind 127.0.0.1:{port} ({e.strerror or e})"
+        print(f"llm-usage: cannot bind 0.0.0.0:{port} ({e.strerror or e})"
               " — is another llm-usage --html already running?"
               " Choose a different port with --port <n>.",
               file=sys.stderr)
@@ -2616,7 +2617,8 @@ def run_html_server(fresh: bool, port: int = DEFAULT_HTML_PORT) -> int:
     url = f"http://127.0.0.1:{bound_port}/"
     # Flush immediately: with stdout piped or captured, the URL must not sit
     # in a block buffer for the lifetime of the server.
-    print(f"llm-usage dashboard: {url}  (Ctrl-C to stop)", flush=True)
+    print(f"llm-usage dashboard: listening on 0.0.0.0:{bound_port}"
+          f" — local URL: {url}  (Ctrl-C to stop)", flush=True)
     threading.Thread(target=webbrowser.open, args=(url,),
                      daemon=True).start()
     try:

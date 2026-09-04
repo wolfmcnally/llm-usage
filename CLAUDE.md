@@ -19,7 +19,7 @@ echo $?              # 0 = both OK, 1 = one provider failed, 2 = both failed
 ./llm-usage --fresh   # bypass the cache for this run, hit the APIs live
 ./llm-usage --json     # machine-readable snapshot (also cached)
 ./llm-usage --tui      # interactive curses view with resize + vertical scroll
-./llm-usage --html     # loopback-server browser dashboard, opens preferred browser
+./llm-usage --html     # all-interface browser dashboard, opens preferred browser
 ./llm-usage --html-static <path>  # write one self-contained snapshot page
 ```
 
@@ -30,7 +30,7 @@ combination exits 2, as does `--html-static` without a path. In TUI mode,
 refreshes are cache-aware — `--html` treats `--fresh` the same way (initial
 payload only).
 
-`--html` binds the pinned port 17399 on 127.0.0.1 (stable URL
+`--html` binds the pinned port 17399 on all IPv4 interfaces (`0.0.0.0`; local URL
 `http://127.0.0.1:17399/`; 17399 is IANA-unassigned, unclaimed by known
 products, and below all OS ephemeral ranges), prints the URL (flushed), opens
 it via `webbrowser`, and serves `/` (page with embedded payload) plus

@@ -118,9 +118,9 @@ returns to normal cache-aware refresh behavior.
   <img alt="The llm-usage HTML dashboard: two provider cards with status-colored usage bars, a now tick on each bar, and green headroom / red overrun bands between them" src="docs/html-dashboard-light.png">
 </picture>
 
-`llm-usage --html` serves a display-only browser dashboard from a loopback HTTP
-server at the stable, bookmarkable **`http://127.0.0.1:17399/`** and opens it in
-your preferred browser. (17399 is IANA-unassigned, claimed by no known product,
+`llm-usage --html` serves a display-only browser dashboard on all IPv4 interfaces (`0.0.0.0`), opens **`http://127.0.0.1:17399/`** in your preferred browser, and is accessible from other devices at `http://<host-ip>:17399/` when the network permits it.
+
+(17399 is IANA-unassigned, claimed by no known product,
 and below every OS ephemeral-port range.) Pass `--port <n>` to serve elsewhere
 for a run; if the port cannot be bound — most likely another `llm-usage --html`
 is already running — the tool fails hard with exit code `2` rather than
