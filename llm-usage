@@ -626,6 +626,11 @@ STATUS_URLS = {
     "openai": "https://status.openai.com/api/v2/summary.json",
 }
 
+STATUS_PAGE_URLS = {
+    "anthropic": "https://status.claude.com/",
+    "openai": "https://status.openai.com/",
+}
+
 
 def status_ttl() -> int:
     """Persistent public-status cache TTL; zero disables all caching."""
@@ -888,6 +893,7 @@ def provider_status_json(snapshot: dict | None) -> dict:
         "stale": bool(snapshot.get("stale")),
         "cache_age_seconds": snapshot.get("age"),
         "error": snapshot.get("error"),
+        "page_url": STATUS_PAGE_URLS.get(str(snapshot.get("provider") or "")),
     }
 
 
@@ -2053,6 +2059,8 @@ main{display:grid;gap:18px;
 .n-crit{color:var(--critical)}
 .svc{font-size:12px;color:var(--ink2);padding:7px 0 3px;
   display:flex;gap:7px;align-items:baseline}
+.svc a{color:inherit;text-decoration:none;opacity:.75}
+.svc a:hover{opacity:1;text-decoration:underline}
 .dot{width:8px;height:8px;border-radius:50%;flex:none;
   display:inline-block;transform:translateY(.5px)}
 .err{color:var(--critical);font-size:13px;padding:10px 0 6px}
@@ -2094,7 +2102,6 @@ footer{margin-top:28px;color:var(--muted);font-size:12px;
 .legend{display:flex;gap:6px 16px;flex-wrap:wrap}
 .lg{display:inline-flex;gap:7px;align-items:center;white-space:nowrap}
 .sw{width:13px;height:9px;border-radius:2px;display:inline-block;flex:none}
-.sw-tick{width:2px;height:13px;border-radius:0;background:var(--ink2)}
 @media (max-width:520px){
   .card{padding:14px 16px 12px}
   .util{font-size:18px}
@@ -2119,7 +2126,6 @@ footer{margin-top:28px;color:var(--muted);font-size:12px;
       <span class="lg"><i class="sw" style="background:var(--warning)"></i>&ge;50%</span>
       <span class="lg"><i class="sw" style="background:var(--serious)"></i>&ge;75%</span>
       <span class="lg"><i class="sw" style="background:var(--critical)"></i>&ge;90%</span>
-      <span class="lg"><i class="sw sw-tick"></i>now (window elapsed)</span>
     </div>
   </footer>
 </div>
@@ -2283,10 +2289,21 @@ function serviceLine(ss) {
     d.style.background = color;
     return d;
   };
+  const link = () => {
+    if (!ss.page_url) return null;
+    const a = h("a", null, "\u2197");
+    a.href = ss.page_url;
+    a.target = "_blank";
+    a.rel = "noopener";
+    a.title = "Open status page";
+    a.setAttribute("aria-label", "Open status page");
+    return a;
+  };
   if (!ss.available) {
     if (!ss.error) return null;
     return h("div", "svc", dot("var(--serious)"),
-      h("span", null, "service status unavailable (" + ss.error + ")"));
+      h("span", null, "service status unavailable (" + ss.error + ")"),
+      link());
   }
   if (ss.operational && !ss.stale) return null;
   const confirmed = ss.stale
@@ -2297,13 +2314,14 @@ function serviceLine(ss) {
   if (ss.operational) {
     return h("div", "svc", dot("var(--serious)"),
       h("span", null, "status unavailable; last known: "
-        + ss.description + confirmed));
+        + ss.description + confirmed), link());
   }
   const color = ss.indicator === "major" || ss.indicator === "critical"
     ? "var(--critical)"
     : ss.indicator === "minor" ? "var(--serious)" : "var(--warning)";
   return h("div", "svc", dot(color),
-    h("span", null, (ss.description || "Service disruption") + confirmed));
+    h("span", null, (ss.description || "Service disruption") + confirmed),
+    link());
 }
 
 function extrasEl(parts) {
