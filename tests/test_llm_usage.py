@@ -201,32 +201,71 @@ class OpenAIUsageTests(unittest.TestCase):
                 snapshot, window)
         self.assertEqual(remaining, 870.0)
 
-    def test_render_includes_credits_and_can_suppress_codex_spark(self):
+    def _render_plain(self, body: dict) -> tuple[list[str], str, bool]:
         snapshot = {
             "token": {"access_token": "fixture", "expires_at_ms": None},
             "code": 200,
-            "body": self.body,
+            "body": body,
             "age": 120.0,
             "loaded_at": 1000.0,
         }
         with mock.patch.object(llm_usage.time, "time", return_value=1010.0):
             lines, ok = llm_usage.render_openai_section(snapshot, 120)
         plain = "\n".join(llm_usage.ANSI_RE.sub("", line) for line in lines)
+        return lines, plain, ok
+
+    def test_render_includes_credits_and_labels_used_extra_limits(self):
+        lines, plain, ok = self._render_plain(self.body)
         self.assertTrue(ok)
         self.assertIn("credit balance 42.5", plain)
         self.assertIn("2 usage resets", plain)
         self.assertIn("next expires", plain)
-        self.assertIn("GPT-5.3-Codex-Spark", plain)
+        # Spark has usage in the fixture, so it renders under a friendly name.
+        self.assertIn("Codex Spark", plain)
+        self.assertNotIn("GPT-5.3-Codex-Spark", plain)
+        # Luna Reserve sits at 0% in the fixture, so it stays hidden.
+        self.assertNotIn("Reserve", plain)
+        self.assertNotIn("gpt-reserve", plain)
         self.assertTrue(all(llm_usage.visible_len(line) <= 120
                             for line in lines))
 
-        with mock.patch.object(llm_usage.time, "time", return_value=1010.0):
-            tui_lines, ok = llm_usage.render_openai_section(
-                snapshot, 120, suppress_codex_spark=True)
-        tui_plain = "\n".join(
-            llm_usage.ANSI_RE.sub("", line) for line in tui_lines)
+    def test_render_hides_untouched_extra_limits_and_shows_used_ones(self):
+        body = json.loads(json.dumps(self.body))
+        spark, reserve = body["additional_rate_limits"]
+        for key in ("primary_window", "secondary_window"):
+            spark["rate_limit"][key]["used_percent"] = 0
+        reserve["rate_limit"]["primary_window"]["used_percent"] = 12
+        _lines, plain, ok = self._render_plain(body)
         self.assertTrue(ok)
-        self.assertNotIn("GPT-5.3-Codex-Spark", tui_plain)
+        self.assertNotIn("Spark", plain)
+        self.assertIn("Luna Reserve", plain)
+        self.assertNotIn("gpt-reserve", plain)
+
+    def test_openai_limit_display_name(self):
+        name = llm_usage.openai_limit_display_name
+        self.assertEqual(
+            name("GPT-5.3-Codex-Spark", "codex_bengalfox", None),
+            "Codex Spark")
+        self.assertEqual(
+            name("gpt-reserve", "base_model_inference", "gpt-5.6-luna"),
+            "Luna Reserve")
+        self.assertEqual(
+            name("gpt-reserve", "base_model_inference", None),
+            "GPT Reserve")
+        self.assertEqual(
+            name("gpt-reserve", "base_model_inference", "gpt-5.7"),
+            "GPT Reserve")
+        self.assertEqual(name("Some Future Limit", "other", None),
+                         "Some Future Limit")
+
+    def test_openai_limit_in_use(self):
+        in_use = llm_usage.openai_limit_in_use
+        self.assertFalse(in_use({"primary_window": {"used_percent": 0},
+                                 "secondary_window": None}))
+        self.assertTrue(in_use({"primary_window": {"used_percent": 0},
+                                "secondary_window": {"used_percent": 0.5}}))
+        self.assertFalse(in_use({"primary_window": {"used_percent": "n/a"}}))
+        self.assertFalse(in_use({}))
 
     def test_json_normalizes_current_openai_usage_shape(self):
         with mock.patch.object(
@@ -258,14 +297,22 @@ class OpenAIUsageTests(unittest.TestCase):
             1893456000.0,
         )
         self.assertTrue(result["service_status"]["operational"])
-        self.assertEqual(len(result["additional_rate_limits"]), 1)
-        extra = result["additional_rate_limits"][0]
+        self.assertEqual(len(result["additional_rate_limits"]), 2)
+        extra, reserve = result["additional_rate_limits"]
         self.assertEqual(extra["name"], "GPT-5.3-Codex-Spark")
+        self.assertEqual(extra["display_name"], "Codex Spark")
         self.assertEqual(extra["metered_feature"], "codex_bengalfox")
+        self.assertTrue(extra["in_use"])
         self.assertEqual(
             extra["windows"]["secondary_window"]["utilization"], 7.0)
         self.assertEqual(
             extra["windows"]["secondary_window"]["window_seconds"], 604800)
+        # The JSON surface keeps untouched allowances; only rendering hides them.
+        self.assertEqual(reserve["name"], "gpt-reserve")
+        self.assertEqual(reserve["display_name"], "Luna Reserve")
+        self.assertEqual(reserve["normal_model_slug"], "gpt-5.6-luna")
+        self.assertFalse(reserve["in_use"])
+        self.assertEqual(list(reserve["windows"]), ["primary_window"])
 
     def test_reset_credit_detail_rows_are_a_forward_compatible_fallback(self):
         body = {

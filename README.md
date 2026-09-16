@@ -157,7 +157,11 @@ carry a display `label`, and each provider object reports `oauth_expires_at_ms`
 for the credential it used. The Anthropic object also includes normalized
 `usage_credits` and limit metadata
 such as `kind`, `is_active`, and `severity`. The OpenAI object includes
-`additional_rate_limits`, `credits`, and `rate_limit_reset_credits`. Reset-credit
+`additional_rate_limits`, `credits`, and `rate_limit_reset_credits`. Each
+additional limit carries its raw `name`, a friendly `display_name` (for
+example "Codex Spark" or "Luna Reserve"), and `in_use`, which is true once any
+of its windows is above 0%; the terminal and HTML renderers hide groups that
+are not in use, while JSON always lists them. Reset-credit
 output includes `details_complete`, `next_expires_at`, and
 `next_expires_in_seconds`; expiration fields are `null` unless every available
 credit has a reported expiration. Relative reset countdowns are reduced by the

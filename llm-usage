@@ -1715,7 +1715,12 @@ def openai_credit_status_line(body: dict) -> str | None:
 
 def openai_additional_rate_limits(body: dict
                                   ) -> list[tuple[str, dict, str | None]]:
-    """Return named model/feature-specific rate-limit groups."""
+    """Return named model/feature-specific rate-limit groups.
+
+    Each tuple is (display title, rate_limit object, metered feature). The
+    title is the user-facing name from `openai_limit_display_name`; the raw
+    `limit_name` is still available on the `--json` surface as `name`.
+    """
     groups = []
     for item in body.get("additional_rate_limits") or []:
         if not isinstance(item, dict):
@@ -1725,15 +1730,54 @@ def openai_additional_rate_limits(body: dict
             continue
         feature = item.get("metered_feature")
         title = item.get("limit_name") or feature or "Additional limit"
-        groups.append((str(title), rate_limit,
-                       str(feature) if feature is not None else None))
+        feature_str = str(feature) if feature is not None else None
+        groups.append((
+            openai_limit_display_name(str(title), feature_str,
+                                      item.get("normal_model_slug")),
+            rate_limit,
+            feature_str,
+        ))
     return groups
 
 
-def is_codex_spark_limit(title: str, feature: str | None) -> bool:
-    """Whether an additional rate-limit group is the Codex Spark quota."""
-    normalized_title = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
-    return feature == "codex_bengalfox" or "codex-spark" in normalized_title
+def openai_limit_display_name(title: str, feature: str | None,
+                              model_slug: str | None = None) -> str:
+    """Friendly label for an additional rate-limit group.
+
+    OpenAI reports these with internal identifiers: the Codex Spark research
+    preview arrives as `GPT-5.3-Codex-Spark` / `codex_bengalfox`, and the
+    Luna Reserve fallback allowance arrives as `gpt-reserve` with the reserve
+    model in `normal_model_slug` (e.g. `gpt-5.6-luna`). Anything unrecognized
+    keeps its reported name.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+    if feature == "codex_bengalfox" or "codex-spark" in slug:
+        return "Codex Spark"
+    if slug == "gpt-reserve" or slug.endswith("-reserve"):
+        model = re.sub(r"[^a-z0-9]+", "-", str(model_slug or "").lower())
+        tail = model.strip("-").rsplit("-", 1)[-1]
+        if tail and not re.fullmatch(r"[0-9.]+|gpt", tail):
+            return f"{tail.title()} Reserve"
+        return "GPT Reserve"
+    return title
+
+
+def openai_limit_in_use(rate_limit: dict) -> bool:
+    """Whether any window of an additional rate-limit group shows usage.
+
+    Spark and Luna Reserve allowances sit at 0% unless the user opts into
+    them, so an untouched group is noise on the dashboard and stays hidden.
+    """
+    for key in ("primary_window", "secondary_window"):
+        window = rate_limit.get(key)
+        if not isinstance(window, dict):
+            continue
+        try:
+            if float(window.get("used_percent") or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
 
 
 def openai_limit_heading(title: str, rate_limit: dict) -> str:
@@ -1745,8 +1789,7 @@ def openai_limit_heading(title: str, rate_limit: dict) -> str:
     return f"  {DIM}{title}{RESET}{status}"
 
 
-def render_openai_section(snapshot: dict, width: int,
-                          suppress_codex_spark: bool = False
+def render_openai_section(snapshot: dict, width: int
                           ) -> tuple[list[str], bool]:
     """Render the OpenAI section. Returns lines plus success state."""
     lines = []
@@ -1804,11 +1847,12 @@ def render_openai_section(snapshot: dict, width: int,
 
     # Weekly (secondary) window first — it's the limit that matters most.
     base_rows = openai_window_rows(snapshot, rl)
+    # Named allowances (Codex Spark, Luna Reserve) only earn a row once
+    # something has actually drawn on them.
     additional_groups = [
         (title, rate_limit, openai_window_rows(snapshot, rate_limit))
-        for title, rate_limit, feature in openai_additional_rate_limits(body)
-        if not suppress_codex_spark
-        or not is_codex_spark_limit(title, feature)
+        for title, rate_limit, _feature in openai_additional_rate_limits(body)
+        if openai_limit_in_use(rate_limit)
     ]
     window_rows = base_rows + [
         window_row
@@ -1921,7 +1965,11 @@ def _openai_json(service_status_snapshot: dict | None = None) -> dict:
             "window_seconds": w.get("limit_window_seconds"),
         }
     additional = []
-    for title, rate_limit, feature in openai_additional_rate_limits(o):
+    raw_groups = [item for item in o.get("additional_rate_limits") or []
+                  if isinstance(item, dict)
+                  and isinstance(item.get("rate_limit"), dict)]
+    for raw, (title, rate_limit, feature) in zip(
+            raw_groups, openai_additional_rate_limits(o)):
         extra_windows: dict[str, Any] = {}
         for key in ("secondary_window", "primary_window"):
             w = rate_limit.get(key)
@@ -1934,8 +1982,11 @@ def _openai_json(service_status_snapshot: dict | None = None) -> dict:
                 "window_seconds": w.get("limit_window_seconds"),
             }
         additional.append({
-            "name": title,
+            "name": raw.get("limit_name") or feature or "Additional limit",
+            "display_name": title,
             "metered_feature": feature,
+            "normal_model_slug": raw.get("normal_model_slug"),
+            "in_use": openai_limit_in_use(rate_limit),
             "allowed": bool(rate_limit.get("allowed", True)),
             "limit_reached": bool(rate_limit.get("limit_reached")),
             "windows": extra_windows,
@@ -2360,13 +2411,6 @@ function anthExtras(p) {
   return extrasEl(parts);
 }
 
-function isSpark(group) {
-  if (group.metered_feature === "codex_bengalfox") return true;
-  const slug = String(group.name || "")
-    .toLowerCase().replace(/[^a-z0-9]+/g, "-");
-  return slug.indexOf("codex-spark") !== -1;
-}
-
 function winRow(key, w) {
   return {
     label: windowLabel(w.window_seconds,
@@ -2381,7 +2425,7 @@ function oaRows(p) {
   const out = Object.entries(p.windows || {})
     .map(([key, w]) => winRow(key, w));
   for (const group of p.additional_rate_limits || []) {
-    if (isSpark(group)) continue;
+    if (!group.in_use) continue;
     const rows = Object.entries(group.windows || {})
       .map(([key, w]) => winRow(key, w));
     if (!rows.length) continue;
@@ -2391,7 +2435,8 @@ function oaRows(p) {
     } else if (group.allowed === false) {
       badges.push(h("span", "badge", "\\u26a0 not currently allowed"));
     }
-    out.push({group: true, name: group.name, badges: badges});
+    out.push({group: true, name: group.display_name || group.name,
+              badges: badges});
     out.push(...rows);
   }
   return out;
@@ -2690,16 +2735,13 @@ def legend_lines() -> list[str]:
 
 
 def render_dashboard_snapshot(snapshot: dict, columns: int,
-                              clamp_width: bool,
-                              suppress_codex_spark: bool = False
-                              ) -> tuple[list[str], int]:
+                              clamp_width: bool) -> tuple[list[str], int]:
     width = display_width(columns, clamp_width)
     lines = []
     a_lines, a_ok = render_anthropic_section(snapshot["anthropic"], width)
     lines.extend(a_lines)
     lines.extend(["", RULE_FG + "═" * width + RESET, ""])
-    o_lines, o_ok = render_openai_section(
-        snapshot["openai"], width, suppress_codex_spark)
+    o_lines, o_ok = render_openai_section(snapshot["openai"], width)
     lines.extend(o_lines)
     lines.append("")
     lines.extend(legend_lines())
@@ -2707,12 +2749,11 @@ def render_dashboard_snapshot(snapshot: dict, columns: int,
     return [clip_ansi(line, width) for line in lines], dashboard_exit_code(a_ok, o_ok)
 
 
-def render_dashboard(columns: int, clamp_width: bool,
-                     suppress_codex_spark: bool = False
+def render_dashboard(columns: int, clamp_width: bool
                      ) -> tuple[dict, list[str], int]:
     snapshot = load_dashboard_snapshot()
     lines, exit_code = render_dashboard_snapshot(
-        snapshot, columns, clamp_width, suppress_codex_spark)
+        snapshot, columns, clamp_width)
     return snapshot, lines, exit_code
 
 
@@ -2875,7 +2916,7 @@ def run_tui(initial_fresh: bool) -> int:
         pairs = setup_curses(curses, stdscr)
         height, width = stdscr.getmaxyx()
         snapshot, lines, exit_code = render_dashboard(
-            width, clamp_width=False, suppress_codex_spark=True)
+            width, clamp_width=False)
         if initial_fresh:
             set_cache_read_bypass(no_cache_env())
         scroll = 0
@@ -2888,7 +2929,7 @@ def run_tui(initial_fresh: bool) -> int:
             if now >= next_data:
                 height, width = stdscr.getmaxyx()
                 snapshot, lines, exit_code = render_dashboard(
-                    width, clamp_width=False, suppress_codex_spark=True)
+                    width, clamp_width=False)
                 next_data = float(snapshot["deadline"])
                 next_repaint = now + TUI_REPAINT_SECONDS
                 scroll = clamp_scroll(scroll, len(lines), height)
@@ -2897,8 +2938,7 @@ def run_tui(initial_fresh: bool) -> int:
             if now >= next_repaint:
                 height, width = stdscr.getmaxyx()
                 lines, exit_code = render_dashboard_snapshot(
-                    snapshot, width, clamp_width=False,
-                    suppress_codex_spark=True)
+                    snapshot, width, clamp_width=False)
                 next_repaint = now + TUI_REPAINT_SECONDS
                 scroll = clamp_scroll(scroll, len(lines), height)
                 draw_tui(curses, stdscr, lines, scroll, pairs)
@@ -2919,8 +2959,7 @@ def run_tui(initial_fresh: bool) -> int:
             redraw = False
             if ch == curses.KEY_RESIZE:
                 lines, exit_code = render_dashboard_snapshot(
-                    snapshot, width, clamp_width=False,
-                    suppress_codex_spark=True)
+                    snapshot, width, clamp_width=False)
                 redraw = True
             elif ch in (curses.KEY_UP, ord("k"), ord("K")):
                 scroll -= 1

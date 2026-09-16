@@ -31,7 +31,23 @@
           "limit_window_seconds": 604800,
           "reset_after_seconds": 500000
         }
-      }
+      },
+      "normal_model_slug": null
+    },
+    {
+      "limit_name": "gpt-reserve",
+      "metered_feature": "base_model_inference",
+      "rate_limit": {
+        "allowed": true,
+        "limit_reached": false,
+        "primary_window": {
+          "used_percent": 0,
+          "limit_window_seconds": 604800,
+          "reset_after_seconds": 604800
+        },
+        "secondary_window": null
+      },
+      "normal_model_slug": "gpt-5.6-luna"
     }
   ],
   "credits": {
