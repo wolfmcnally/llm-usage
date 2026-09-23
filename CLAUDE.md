@@ -21,7 +21,11 @@ echo $?              # 0 = both OK, 1 = one provider failed, 2 = both failed
 ./llm-usage --tui      # interactive curses view with resize + vertical scroll
 ./llm-usage --html     # all-interface browser dashboard, opens preferred browser
 ./llm-usage --html-static <path>  # write one self-contained snapshot page
+./llm-usage --version  # print version (`__version__`) and exit 0, no fetch
 ```
+
+Releases are git tags `vX.Y.Z` on `master`, matching `__version__` in the
+script; bump the constant in the commit that the tag points at.
 
 `--tui` requires an interactive terminal and exits 2 when stdout is not a TTY.
 `--tui`, `--json`, `--html`, and `--html-static` are mutually exclusive; any

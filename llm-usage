@@ -39,6 +39,7 @@ credential, network failure, or API error for one provider degrades to an
 inline error line in that section while the other still renders fully.
 
 Exit codes: 0 = both providers OK, 1 = one provider failed, 2 = both failed.
+--version prints the version and exits 0 without touching any provider.
 
 Output modes (choose at most one): the default one-shot ANSI render, --json
 (machine-readable snapshot), --tui (interactive curses view), --html (serves a
@@ -105,6 +106,8 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timezone
 from typing import Any
+
+__version__ = "0.1.0"
 
 # ---------------------------------------------------------------- ANSI ----
 
@@ -3179,6 +3182,9 @@ def parse_port_flag(args: list[str]) -> tuple[int | None, str | None]:
 
 def main() -> None:
     args = sys.argv[1:]
+    if "--version" in args:
+        print(f"llm-usage {__version__}")
+        return
     fresh = parse_cache_flags(args)
     tui = "--tui" in args
     json_mode = "--json" in args

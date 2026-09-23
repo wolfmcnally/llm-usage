@@ -730,6 +730,19 @@ class AnthropicResetGrantTests(unittest.TestCase):
                              llm_usage.CLAUDE_CLI_VERSION_FALLBACK)
 
 
+class VersionTests(unittest.TestCase):
+    def test_version_flag_prints_version_without_fetching(self):
+        with mock.patch.object(llm_usage.sys, "argv",
+                               ["llm-usage", "--version"]), mock.patch.object(
+                llm_usage, "render_dashboard") as render, mock.patch(
+                "builtins.print") as printed:
+            llm_usage.main()
+        render.assert_not_called()
+        printed.assert_called_once_with(
+            f"llm-usage {llm_usage.__version__}")
+        self.assertRegex(llm_usage.__version__, r"^\d+\.\d+\.\d+$")
+
+
 class HtmlOutputTests(unittest.TestCase):
     PAYLOAD = {
         "anthropic": {"ok": True, "windows": {}},
