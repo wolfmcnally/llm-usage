@@ -78,7 +78,10 @@ with LLM_USAGE_STATUS_TTL. A status-site failure never becomes a false
 No third-party dependencies — stdlib only. The provider SDKs do not expose
 these usage endpoints; both vendor CLIs hit them directly, and so do we.
 OpenAI reset-credit expiration details are optionally enriched through the
-documented local Codex app-server interface.
+documented local Codex app-server interface. Anthropic banked usage-limit resets
+come from the same usage endpoint with `cedar_ember=1`; the endpoint withholds
+them unless the User-Agent reports a current Claude Code version, which is read
+from the installed `claude` binary.
 """
 
 from __future__ import annotations
@@ -302,12 +305,35 @@ def http_get_json(url: str, headers: dict, timeout: int = 15
     return code, body
 
 
+# Version reported when the installed Claude Code version cannot be read. The
+# usage endpoint withholds banked-reset grants from older CLI versions
+# (`ineligible_reason: "cli_version"`); this one is known to pass that gate.
+CLAUDE_CLI_VERSION_FALLBACK = "2.1.280"
+_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+
+
+def claude_cli_version() -> str:
+    """Installed Claude Code version, for the usage endpoint's User-Agent.
+
+    The native installer links `claude` to a binary named by its version
+    (…/claude/versions/2.1.280); any other layout uses the fallback.
+    """
+    found = shutil.which("claude")
+    if found:
+        name = os.path.basename(os.path.realpath(found))
+        if _VERSION_RE.match(name):
+            return name
+    return CLAUDE_CLI_VERSION_FALLBACK
+
+
 def fetch_anthropic(tok: dict) -> tuple[int | None, Any]:
+    # `cedar_ember=1` adds the banked usage-limit reset grants to the
+    # otherwise unchanged response.
     return http_get_json(
-        "https://api.anthropic.com/api/oauth/usage",
+        "https://api.anthropic.com/api/oauth/usage?cedar_ember=1",
         {
             "Authorization": f"Bearer {tok['access_token']}",
-            "User-Agent": "claude-cli/1.0 (external, cli)",
+            "User-Agent": f"claude-cli/{claude_cli_version()} (external, cli)",
             "anthropic-beta": "oauth-2025-04-20",
         },
     )
@@ -567,6 +593,11 @@ def cache_read(provider: str) -> tuple[int | None, Any, float] | None:
     if provider == "openai" and code == 200:
         expiry = openai_next_reset_credit_expiry(
             d.get("body") or {}, require_future=False)
+        if expiry is not None and now >= expiry:
+            return None
+    if provider == "anthropic" and code == 200:
+        grants = anthropic_reset_grants(d.get("body") or {}, now=ts)
+        expiry = grants and grants["next_expires_at"]
         if expiry is not None and now >= expiry:
             return None
     return code, d.get("body"), age
@@ -1422,10 +1453,108 @@ def format_money(value: dict | None) -> str | None:
     return f"{symbol}{number}" if symbol else f"{number} {currency}".strip()
 
 
-def anthropic_spend_status_line(body: dict) -> str | None:
+def _aware_epoch(value: Any) -> float | None:
+    """Epoch seconds for a full ISO-8601 timestamp with a zone, else None."""
+    dt = parse_iso(value) if isinstance(value, str) else None
+    if dt is None or dt.tzinfo is None:
+        return None
+    return dt.timestamp()
+
+
+def anthropic_reset_grants(body: dict, now: float | None = None
+                           ) -> dict | None:
+    """Normalize banked usage-limit reset grants (the `cedar_ember` block).
+
+    Returns None when the response carries no grant block (older cached
+    bodies, or a request without `cedar_ember=1`). A grant counts toward
+    `available_count` only while it has resets left, is not paused, has
+    started, and has a well-formed future `ends_at`.
+    """
+    raw = body.get("cedar_ember")
+    if not isinstance(raw, dict):
+        return None
+    if now is None:
+        now = time.time()
+    grants = []
+    for grant in raw.get("grants") or []:
+        if not isinstance(grant, dict):
+            continue
+        left = grant.get("resets_left")
+        if not isinstance(left, (int, float)) or isinstance(left, bool):
+            continue
+        starts = _aware_epoch(grant.get("starts_at"))
+        ends = _aware_epoch(grant.get("ends_at"))
+        available = (left > 0 and not grant.get("paused")
+                     and ends is not None and ends > now
+                     and (starts is None or starts <= now))
+        grants.append({
+            "id": grant.get("id"),
+            "label": grant.get("label"),
+            "resets_left": max(0, int(left)),
+            "resets_total": grant.get("resets_total"),
+            "starts_at": grant.get("starts_at"),
+            "ends_at": grant.get("ends_at"),
+            "ends_at_epoch": ends,
+            "clears": grant.get("clears") or [],
+            "paused": bool(grant.get("paused")),
+            "usable_now": bool(grant.get("usable_now")),
+            "use_requires_limit": bool(grant.get("use_requires_limit")),
+            "available": available,
+        })
+    available = [grant for grant in grants if grant["available"]]
+    next_id = raw.get("next_grant_id")
+    next_grant = next((grant for grant in available
+                       if grant["id"] == next_id), None)
+    if next_grant is None and available:
+        next_grant = min(available, key=lambda grant: grant["ends_at_epoch"])
+    next_expiry = (min(grant["ends_at_epoch"] for grant in available)
+                   if available else None)
+    return {
+        "eligible": bool(raw.get("eligible")),
+        "ineligible_reason": raw.get("ineligible_reason"),
+        "available_count": sum(grant["resets_left"] for grant in available),
+        "next_grant_id": next_grant["id"] if next_grant else None,
+        "usable_now": bool(next_grant and next_grant["usable_now"]),
+        "use_requires_limit": bool(
+            next_grant and next_grant["use_requires_limit"]),
+        "cooldown_until": raw.get("cooldown_until"),
+        "next_expires_at": next_expiry,
+        "next_expires_in_seconds": (
+            max(0.0, next_expiry - now) if next_expiry is not None else None),
+        "grants": grants,
+    }
+
+
+def anthropic_reset_parts(body: dict) -> list[str]:
+    """Extras segments for banked usage-limit resets."""
+    grants = anthropic_reset_grants(body)
+    if not grants or not grants["available_count"]:
+        return []
+    parts = [reset_credit_text(grants["available_count"],
+                               grants["next_expires_at"])]
+    if not grants["usable_now"]:
+        cooldown = _aware_epoch(grants.get("cooldown_until"))
+        if cooldown is not None and cooldown > time.time():
+            text = f"cooling down until {fmt_reset_credit_expiry(cooldown)}"
+        elif grants["use_requires_limit"]:
+            text = "usable once limited"
+        else:
+            text = "not usable now"
+        parts.append(f"{fg256(214)}{text}{RESET}")
+    return parts
+
+
+def anthropic_extras_line(body: dict) -> str | None:
+    parts = anthropic_spend_parts(body) + anthropic_reset_parts(body)
+    if not parts:
+        return None
+    return f"  {DIM}Extras:{RESET} " + (SUB_FG + " · " + RESET).join(parts)
+
+
+def anthropic_spend_parts(body: dict) -> list[str]:
     spend = normalize_anthropic_spend(body)
     if not spend:
-        return None
+        return []
     used_money = spend.get("used") or {}
     used_amount = used_money.get("amount")
     has_spend = (isinstance(used_amount, (int, float))
@@ -1435,7 +1564,7 @@ def anthropic_spend_status_line(body: dict) -> str | None:
     severity = spend.get("severity")
     actionable_severity = severity not in (None, "normal")
     if not (spend["enabled"] or has_spend or actionable_severity):
-        return None
+        return []
 
     parts = []
     if spend["enabled"]:
@@ -1450,7 +1579,7 @@ def anthropic_spend_status_line(body: dict) -> str | None:
         parts.append(f"{fg256(214)}{str(reason).replace('_', ' ')}{RESET}")
     if actionable_severity:
         parts.append(f"{fg256(214)}{str(severity).replace('_', ' ')}{RESET}")
-    return f"  {DIM}Extras:{RESET} " + (SUB_FG + " · " + RESET).join(parts)
+    return parts
 
 
 def anthropic_snapshot() -> dict:
@@ -1511,9 +1640,9 @@ def render_anthropic_section(snapshot: dict, width: int) -> tuple[list[str], boo
         lines.append(warn_line(f"API error {code}: {json.dumps(body)[:200]}"))
         return [clip_ansi(line, width) for line in lines], False
 
-    spend_line = anthropic_spend_status_line(body)
-    if spend_line:
-        lines.append(spend_line)
+    extras_line = anthropic_extras_line(body)
+    if extras_line:
+        lines.append(extras_line)
 
     now = datetime.now(timezone.utc)
     bands = anthropic_limit_bands(body)
@@ -1668,6 +1797,29 @@ def fmt_reset_credit_expiry(expires_at: float) -> str:
     return dt.strftime("%a %b %d %H:%M %Z")
 
 
+def reset_credit_text(count: int, next_expiry: float | None) -> str:
+    """'N usage resets' plus an urgency-colored next-expiry clause."""
+    noun = "reset" if count == 1 else "resets"
+    text = f"{fg256(78)}{count} usage {noun}{RESET}"
+    if next_expiry is None:
+        return text
+    remaining = next_expiry - time.time()
+    if remaining <= 4 * 3600:
+        expiry_color = fg256(203)
+    elif remaining <= 24 * 3600:
+        expiry_color = fg256(214)
+    elif remaining <= 3 * 86400:
+        expiry_color = fg256(186)
+    else:
+        expiry_color = SUB_FG
+    if remaining <= 3 * 86400:
+        when = (f"in {fmt_relative(remaining)} "
+                f"({fmt_reset_credit_expiry(next_expiry)})")
+    else:
+        when = fmt_reset_credit_expiry(next_expiry)
+    return text + f"{SUB_FG}, {RESET}{expiry_color}next expires {when}{RESET}"
+
+
 def openai_credit_status_line(body: dict) -> str | None:
     """Compact, read-only status for purchased and usage-reset credits."""
     parts = []
@@ -1684,30 +1836,8 @@ def openai_credit_status_line(body: dict) -> str | None:
 
     reset_count = openai_reset_credit_count(body)
     if reset_count:
-        noun = "reset" if reset_count == 1 else "resets"
-        reset_text = f"{fg256(78)}{reset_count} usage {noun}{RESET}"
-        next_expiry = openai_next_reset_credit_expiry(body)
-        if next_expiry is not None:
-            remaining = next_expiry - time.time()
-            if remaining <= 4 * 3600:
-                expiry_color = fg256(203)
-            elif remaining <= 24 * 3600:
-                expiry_color = fg256(214)
-            elif remaining <= 3 * 86400:
-                expiry_color = fg256(186)
-            else:
-                expiry_color = SUB_FG
-            if remaining <= 3 * 86400:
-                when = (
-                    f"in {fmt_relative(remaining)} "
-                    f"({fmt_reset_credit_expiry(next_expiry)})"
-                )
-            else:
-                when = fmt_reset_credit_expiry(next_expiry)
-            reset_text += (
-                f"{SUB_FG}, {RESET}{expiry_color}next expires {when}{RESET}"
-            )
-        parts.append(reset_text)
+        parts.append(reset_credit_text(
+            reset_count, openai_next_reset_credit_expiry(body)))
     if not parts:
         return None
     return f"  {DIM}Extras:{RESET} " + (SUB_FG + " · " + RESET).join(parts)
@@ -1928,6 +2058,7 @@ def _anthropic_json(service_status_snapshot: dict | None = None) -> dict:
     return {"ok": True, "error": None,
             "subscription": tok.get("subscription"), "windows": windows,
             "usage_credits": normalize_anthropic_spend(a),
+            "rate_limit_reset_credits": anthropic_reset_grants(a),
             "oauth_expires_at_ms": tok.get("expires_at_ms"),
             "cached": age is not None, "cache_age_seconds": age,
             "service_status": service_status}
@@ -2390,13 +2521,50 @@ function anthRows(p) {
   }));
 }
 
+function resetParts(rc) {
+  const count = (rc && rc.available_count) || 0;
+  if (count <= 0) return [];
+  const parts = [h("span", "x-on",
+    count + " usage " + (count === 1 ? "reset" : "resets"))];
+  if (typeof rc.next_expires_in_seconds === "number") {
+    const rem = Math.max(0, rc.next_expires_in_seconds - elapsed());
+    const cls = rem <= 4 * 3600 ? "n-crit"
+      : rem <= 24 * 3600 ? "n-warn" : null;
+    const when = rem <= 3 * 86400
+      ? "in " + fmtRel(rem)
+      : new Date((rc.next_expires_at || 0) * 1000).toLocaleString(
+          undefined, {weekday: "short", month: "short", day: "numeric",
+                      hour: "2-digit", minute: "2-digit"});
+    parts.push(h("span", cls, "next expires " + when));
+  }
+  return parts;
+}
+
+function anthResetParts(p) {
+  const rc = p.rate_limit_reset_credits;
+  const parts = resetParts(rc);
+  if (!parts.length || rc.usable_now) return parts;
+  const cooldown = rc.cooldown_until ? Date.parse(rc.cooldown_until) : NaN;
+  const text = !isNaN(cooldown) && cooldown > Date.now()
+    ? "cooling down until " + new Date(cooldown).toLocaleString(
+        undefined, {weekday: "short", month: "short", day: "numeric",
+                    hour: "2-digit", minute: "2-digit"})
+    : rc.use_requires_limit ? "usable once limited" : "not usable now";
+  parts.push(h("span", "n-warn", text));
+  return parts;
+}
+
 function anthExtras(p) {
+  return extrasEl(anthSpendParts(p).concat(anthResetParts(p)));
+}
+
+function anthSpendParts(p) {
   const uc = p.usage_credits;
-  if (!uc) return null;
+  if (!uc) return [];
   const used = uc.used && typeof uc.used.amount === "number"
     ? uc.used.amount : 0;
   const actionable = uc.severity && uc.severity !== "normal";
-  if (!(uc.enabled || used > 0 || actionable)) return null;
+  if (!(uc.enabled || used > 0 || actionable)) return [];
   const parts = [h("span", uc.enabled ? "x-on" : null,
     "usage credits " + (uc.enabled ? "on" : "off"))];
   const u = money(uc.used), l = money(uc.limit);
@@ -2408,7 +2576,7 @@ function anthExtras(p) {
   if (actionable) {
     parts.push(h("span", "n-warn", String(uc.severity).replace(/_/g, " ")));
   }
-  return extrasEl(parts);
+  return parts;
 }
 
 function winRow(key, w) {
@@ -2455,23 +2623,7 @@ function oaExtras(p) {
       balance !== null && balance !== undefined && balance !== ""
         ? "credit balance " + balance : "credits available"));
   }
-  const rc = p.rate_limit_reset_credits || {};
-  const count = rc.available_count || 0;
-  if (count > 0) {
-    parts.push(h("span", "x-on",
-      count + " usage " + (count === 1 ? "reset" : "resets")));
-    if (typeof rc.next_expires_in_seconds === "number") {
-      const rem = Math.max(0, rc.next_expires_in_seconds - elapsed());
-      const cls = rem <= 4 * 3600 ? "n-crit"
-        : rem <= 24 * 3600 ? "n-warn" : null;
-      const when = rem <= 3 * 86400
-        ? "in " + fmtRel(rem)
-        : new Date((rc.next_expires_at || 0) * 1000).toLocaleString(
-            undefined, {weekday: "short", month: "short", day: "numeric",
-                        hour: "2-digit", minute: "2-digit"});
-      parts.push(h("span", cls, "next expires " + when));
-    }
-  }
+  parts.push(...resetParts(p.rate_limit_reset_credits));
   return extrasEl(parts);
 }
 

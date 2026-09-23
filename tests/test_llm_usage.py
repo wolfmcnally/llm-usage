@@ -524,7 +524,7 @@ class AnthropicUsageTests(unittest.TestCase):
                 "can_toggle": False,
             }
         }
-        self.assertIsNone(llm_usage.anthropic_spend_status_line(body))
+        self.assertIsNone(llm_usage.anthropic_extras_line(body))
 
     def test_spend_status_keeps_actionable_disabled_state(self):
         body = {
@@ -535,7 +535,7 @@ class AnthropicUsageTests(unittest.TestCase):
                 "disabled_reason": "payment_required",
             }
         }
-        line = llm_usage.anthropic_spend_status_line(body)
+        line = llm_usage.anthropic_extras_line(body)
         plain = llm_usage.ANSI_RE.sub("", line)
         self.assertIn("usage credits off", plain)
         self.assertIn("payment required", plain)
@@ -566,6 +566,168 @@ class AnthropicUsageTests(unittest.TestCase):
         self.assertEqual(result["usage_credits"]["source"], "spend")
         self.assertTrue(result["service_status"]["operational"])
         self.assertEqual(result["usage_credits"]["used"]["amount"], 12.34)
+
+
+# 2026-09-22T16:00:00Z, the start of the sanitized grant below.
+GRANT_NOW = 1790092800.0
+
+
+def reset_grant_block(**grant_overrides):
+    """Sanitized `cedar_ember` block in the shape observed 2026-09-22."""
+    grant = {
+        "id": "launch-grant",
+        "label": "Launch: one usage-limit reset",
+        "resets_total": 1,
+        "resets_left": 1,
+        "starts_at": "2026-09-22T16:00:00+00:00",
+        "ends_at": "2026-10-22T16:00:00+00:00",
+        "clears": ["five_hour", "seven_day"],
+        "paused": False,
+        "usable_now": True,
+        "use_requires_limit": False,
+        "percent_used": {"five_hour": 1, "seven_day": 26},
+        "blocking": [],
+        "arm": None,
+    }
+    grant.update(grant_overrides)
+    return {
+        "eligible": True,
+        "ineligible_reason": None,
+        "at_limit": False,
+        "exhausted": [],
+        "grants": [grant],
+        "next_grant_id": "launch-grant",
+        "weekly_resets_at": "2026-09-28T15:00:00+00:00",
+        "cooldown_until": None,
+        "event_props": None,
+    }
+
+
+class AnthropicResetGrantTests(unittest.TestCase):
+    def test_absent_or_ineligible_block_shows_nothing(self):
+        self.assertIsNone(llm_usage.anthropic_reset_grants({}))
+        self.assertIsNone(
+            llm_usage.anthropic_reset_grants({"cedar_ember": None}))
+        ineligible = {"cedar_ember": {
+            "eligible": False, "ineligible_reason": "cli_version",
+            "grants": [], "next_grant_id": None}}
+        grants = llm_usage.anthropic_reset_grants(ineligible, now=GRANT_NOW)
+        self.assertEqual(grants["available_count"], 0)
+        self.assertEqual(grants["ineligible_reason"], "cli_version")
+        self.assertIsNone(llm_usage.anthropic_extras_line(ineligible))
+
+    def test_counts_available_grant_and_reports_expiry(self):
+        body = {"cedar_ember": reset_grant_block()}
+        grants = llm_usage.anthropic_reset_grants(body, now=GRANT_NOW)
+        self.assertEqual(grants["available_count"], 1)
+        self.assertEqual(grants["next_grant_id"], "launch-grant")
+        self.assertTrue(grants["usable_now"])
+        self.assertEqual(grants["next_expires_at"], GRANT_NOW + 30 * 86400)
+        self.assertEqual(grants["next_expires_in_seconds"], 30 * 86400)
+        self.assertEqual(grants["grants"][0]["clears"],
+                         ["five_hour", "seven_day"])
+
+    def test_unavailable_grants_are_not_counted(self):
+        cases = {
+            "paused": {"paused": True},
+            "spent": {"resets_left": 0},
+            "expired": {"ends_at": "2026-09-22T15:59:00+00:00"},
+            "not started": {"starts_at": "2026-09-23T00:00:00+00:00"},
+            "date-only end": {"ends_at": "2026-10-22"},
+            "malformed end": {"ends_at": "2026-02-30T00:00:00+00:00"},
+        }
+        for name, overrides in cases.items():
+            with self.subTest(name):
+                body = {"cedar_ember": reset_grant_block(**overrides)}
+                grants = llm_usage.anthropic_reset_grants(
+                    body, now=GRANT_NOW)
+                self.assertEqual(grants["available_count"], 0)
+                self.assertIsNone(grants["next_expires_at"])
+
+    def test_extras_line_shows_resets_with_hidden_spend(self):
+        body = {
+            "spend": {
+                "enabled": False,
+                "used": {"amount_minor": 0, "currency": "USD"},
+                "severity": "normal",
+                "disabled_reason": "out_of_credits",
+            },
+            "cedar_ember": reset_grant_block(),
+        }
+        with mock.patch.object(llm_usage.time, "time",
+                               return_value=GRANT_NOW):
+            line = llm_usage.anthropic_extras_line(body)
+        plain = llm_usage.ANSI_RE.sub("", line)
+        self.assertIn("1 usage reset, next expires", plain)
+        self.assertNotIn("usage credits", plain)
+        self.assertNotIn("usable", plain)
+
+    def test_extras_line_explains_unusable_grant(self):
+        body = {"cedar_ember": reset_grant_block(
+            usable_now=False, use_requires_limit=True)}
+        with mock.patch.object(llm_usage.time, "time",
+                               return_value=GRANT_NOW):
+            plain = llm_usage.ANSI_RE.sub(
+                "", llm_usage.anthropic_extras_line(body))
+        self.assertIn("usable once limited", plain)
+
+    def test_json_exposes_reset_grants(self):
+        body = {"five_hour": {"utilization": 1.0},
+                "cedar_ember": reset_grant_block()}
+        with mock.patch.object(
+                llm_usage, "load_anthropic_token",
+                return_value={"access_token": "fixture",
+                              "subscription": "max"}), mock.patch.object(
+                llm_usage, "cached_fetch",
+                return_value=(200, body, None)), mock.patch.object(
+                llm_usage.time, "time", return_value=GRANT_NOW):
+            result = llm_usage._anthropic_json(
+                service_status_snapshot("anthropic"))
+        credits = result["rate_limit_reset_credits"]
+        self.assertEqual(credits["available_count"], 1)
+        self.assertEqual(credits["next_grant_id"], "launch-grant")
+
+    def test_anthropic_cache_expires_at_next_grant_expiry(self):
+        cached = {"ts": GRANT_NOW, "code": 200,
+                  "body": {"cedar_ember": reset_grant_block(
+                      ends_at="2026-09-22T16:05:00+00:00")}}
+        for now, expired in ((GRANT_NOW + 299, False),
+                             (GRANT_NOW + 301, True)):
+            with self.subTest(now=now), mock.patch.object(
+                    llm_usage, "_cache_path",
+                    return_value="/fixture/anthropic.json"), mock.patch(
+                    "builtins.open",
+                    mock.mock_open(read_data=json.dumps(cached))), \
+                    mock.patch.object(llm_usage.time, "time",
+                                      return_value=now):
+                hit = llm_usage.cache_read("anthropic")
+                self.assertEqual(hit is None, expired)
+
+    def test_fetch_requests_grants_with_installed_cli_version(self):
+        with mock.patch.object(
+                llm_usage.shutil, "which",
+                return_value="/home/u/.local/bin/claude"), mock.patch.object(
+                llm_usage.os.path, "realpath",
+                return_value="/home/u/.local/share/claude/versions/9.8.7"), \
+                mock.patch.object(llm_usage, "http_get_json",
+                                  return_value=(200, {})) as get:
+            llm_usage.fetch_anthropic({"access_token": "fixture"})
+        url, headers = get.call_args[0]
+        self.assertTrue(url.endswith("/api/oauth/usage?cedar_ember=1"))
+        self.assertEqual(headers["User-Agent"],
+                         "claude-cli/9.8.7 (external, cli)")
+
+    def test_cli_version_falls_back_for_unversioned_installs(self):
+        with mock.patch.object(
+                llm_usage.shutil, "which",
+                return_value="/usr/local/bin/claude"), mock.patch.object(
+                llm_usage.os.path, "realpath",
+                return_value="/usr/local/lib/node_modules/claude/cli.js"):
+            self.assertEqual(llm_usage.claude_cli_version(),
+                             llm_usage.CLAUDE_CLI_VERSION_FALLBACK)
+        with mock.patch.object(llm_usage.shutil, "which", return_value=None):
+            self.assertEqual(llm_usage.claude_cli_version(),
+                             llm_usage.CLAUDE_CLI_VERSION_FALLBACK)
 
 
 class HtmlOutputTests(unittest.TestCase):
