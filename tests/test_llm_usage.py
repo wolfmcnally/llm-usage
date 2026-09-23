@@ -703,6 +703,73 @@ class AnthropicResetGrantTests(unittest.TestCase):
                 hit = llm_usage.cache_read("anthropic")
                 self.assertEqual(hit is None, expired)
 
+    def test_anthropic_refresh_deadline_stops_at_grant_expiry(self):
+        body = {"cedar_ember": reset_grant_block(
+            ends_at="2026-09-22T16:05:00+00:00")}
+        with mock.patch.dict(llm_usage.os.environ, {}, clear=True):
+            deadline = llm_usage.next_data_refresh_deadline(
+                200, 0.0, GRANT_NOW, "anthropic", body)
+        self.assertEqual(deadline, GRANT_NOW + 300)
+
+    def test_lapsed_expiry_does_not_force_refetch_every_tick(self):
+        body = {"rate_limit_reset_credits": {
+            "available_count": 1,
+            "credits": [{"expires_at": GRANT_NOW - 10}]}}
+        with mock.patch.dict(llm_usage.os.environ, {}, clear=True):
+            deadline = llm_usage.next_data_refresh_deadline(
+                200, 0.0, GRANT_NOW, "openai", body)
+        self.assertEqual(deadline, GRANT_NOW + llm_usage.DEFAULT_CACHE_TTL)
+
+
+class ProviderViewTests(unittest.TestCase):
+    """Every surface renders from provider_view's display block."""
+
+    def test_rate_limit_view_carries_retry_clock_and_no_error_line(self):
+        snapshot = {"token": {"access_token": "fixture",
+                              "subscription": "max"},
+                    "code": 429, "body": {}, "age": 60.0,
+                    "loaded_at": 1000.0}
+        with mock.patch.dict(llm_usage.os.environ, {}, clear=True), \
+                mock.patch.object(llm_usage.time, "time",
+                                  return_value=1000.0):
+            view = llm_usage.provider_view("anthropic", snapshot)
+        display = view["display"]
+        self.assertFalse(view["ok"])
+        self.assertTrue(view["rate_limited"])
+        self.assertEqual(display["plan"], "Claude Max Plan")
+        self.assertIsNone(display["error"])
+        notice = display["notices"][0]
+        self.assertEqual(notice["text"], "● rate limited (429), retry in ")
+        self.assertEqual(notice["seconds"],
+                         llm_usage.DEFAULT_RATE_LIMIT_TTL - 60.0)
+        self.assertEqual(notice["counting"], "down")
+
+    def test_openai_view_rows_apply_visibility_rule_once(self):
+        body = json.loads(OPENAI_FIXTURE_PATH.read_text())
+        snapshot = {"token": {"access_token": "fixture"}, "code": 200,
+                    "body": body, "age": 120.0, "loaded_at": 1000.0}
+        with mock.patch.object(llm_usage.time, "time", return_value=1010.0):
+            view = llm_usage.provider_view("openai", snapshot)
+        rows = view["display"]["rows"]
+        headings = [r["text"] for r in rows if r["type"] == "heading"]
+        self.assertEqual(headings, ["Codex Spark"])
+        labels = [r["label"] for r in rows if r["type"] == "row"]
+        self.assertIn("7-day (weekly)", labels)
+        # The JSON surface still lists every group for other consumers.
+        self.assertEqual(len(view["additional_rate_limits"]),
+                         len(body["additional_rate_limits"]))
+        for r in rows:
+            if r["type"] == "row":
+                self.assertIn(r["pace"], ("over", "under", "on", None))
+                self.assertEqual(r["severity"],
+                                 llm_usage.severity_tone(r["utilization"]))
+
+    def test_segment_clock_advances_in_the_declared_direction(self):
+        down = llm_usage.seg("retry in ", "warn", 600)
+        up = llm_usage.seg("cached ", "dim", 600, "up", " ago")
+        self.assertEqual(llm_usage.seg_text(down, elapsed=120), "retry in 8m")
+        self.assertEqual(llm_usage.seg_text(up, elapsed=120), "cached 12m ago")
+
     def test_fetch_requests_grants_with_installed_cli_version(self):
         with mock.patch.object(
                 llm_usage.shutil, "which",

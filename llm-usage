@@ -88,6 +88,7 @@ from the installed `claude` binary.
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import email.utils
 import json
 import locale
@@ -126,14 +127,62 @@ SUB_FG = fg256(245)
 RULE_FG = fg256(240)
 
 
-def color_for_pct(p: float) -> str:
+# Semantic tones shared by every surface. The terminal maps them to 256-color
+# codes here; the HTML page maps the same names to CSS classes.
+TONES = {
+    "good": fg256(78),
+    "caution": fg256(186),
+    "warn": fg256(214),
+    "critical": fg256(203),
+    "dim": DIM,
+    "sub": SUB_FG,
+    "white": WHITE,
+}
+
+
+def severity_tone(p: float) -> str:
+    """Tone for a usage percentage: <50 good, <75 caution, <90 warn."""
     if p < 50:
-        return fg256(78)   # green
+        return "good"
     if p < 75:
-        return fg256(186)  # yellow
+        return "caution"
     if p < 90:
-        return fg256(214)  # orange
-    return fg256(203)      # red
+        return "warn"
+    return "critical"
+
+
+def color_for_pct(p: float) -> str:
+    return TONES[severity_tone(p)]
+
+
+def seg(text: str, tone: str, seconds: float | None = None,
+        counting: str = "down", after: str = "",
+        link: str | None = None) -> dict:
+    """One styled text segment of a provider view.
+
+    A segment with `seconds` embeds a clock: it reads `text`, the formatted
+    duration, then `after`. `counting` says whether that duration shrinks
+    ("down", a countdown) or grows ("up", an age) as the view gets older, so
+    a renderer can keep it current without re-deriving the rule behind it.
+    """
+    segment = {"text": text, "tone": tone}
+    if seconds is not None:
+        segment.update(seconds=seconds, counting=counting, after=after)
+    if link:
+        segment["link"] = link
+    return segment
+
+
+def seg_text(segment: dict, elapsed: float = 0.0) -> str:
+    if "seconds" not in segment:
+        return segment["text"]
+    seconds = segment["seconds"]
+    seconds = seconds + elapsed if segment["counting"] == "up" else seconds - elapsed
+    return segment["text"] + fmt_relative(seconds) + segment["after"]
+
+
+def seg_ansi(segment: dict, before: str = "", after: str = "") -> str:
+    return f"{TONES[segment['tone']]}{before}{seg_text(segment)}{after}{RESET}"
 
 
 def visible_len(s: str) -> int:
@@ -207,6 +256,16 @@ def jwt_claims(token: str | None) -> dict | None:
         return None
 
 
+def _anthropic_token_from(d: dict) -> dict:
+    c = d.get("claudeAiOauth", {})
+    return {
+        "access_token": c.get("accessToken"),
+        "expires_at_ms": c.get("expiresAt"),
+        "subscription": c.get("subscriptionType"),
+        "org": d.get("organizationUuid"),
+    }
+
+
 def load_anthropic_token() -> dict | None:
     if t := os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
         return {"access_token": t, "expires_at_ms": None,
@@ -220,14 +279,7 @@ def load_anthropic_token() -> dict | None:
                  "-a", user, "-w"],
                 stderr=subprocess.DEVNULL,
             ).decode().strip()
-            d = json.loads(out)
-            c = d.get("claudeAiOauth", {})
-            return {
-                "access_token": c.get("accessToken"),
-                "expires_at_ms": c.get("expiresAt"),
-                "subscription": c.get("subscriptionType"),
-                "org": d.get("organizationUuid"),
-            }
+            return _anthropic_token_from(json.loads(out))
         except (subprocess.CalledProcessError, json.JSONDecodeError, OSError):
             pass
     p = os.path.expanduser("~/.claude/.credentials.json")
@@ -237,13 +289,7 @@ def load_anthropic_token() -> dict | None:
                 d = json.load(f)
         except (OSError, json.JSONDecodeError):
             return None
-        c = d.get("claudeAiOauth", {})
-        return {
-            "access_token": c.get("accessToken"),
-            "expires_at_ms": c.get("expiresAt"),
-            "subscription": c.get("subscriptionType"),
-            "org": d.get("organizationUuid"),
-        }
+        return _anthropic_token_from(d)
     return None
 
 
@@ -505,15 +551,18 @@ TUI_REPAINT_SECONDS = 60
 _CACHE_READ_BYPASS = False     # set by --fresh/--no-cache or env
 
 
+def _env_int(name: str) -> int | None:
+    """Integer value of an environment variable; None when unset or invalid."""
+    try:
+        return int(os.environ[name])
+    except (KeyError, ValueError):
+        return None
+
+
 def _caching_off() -> bool:
     """True when cache reads and writes are disabled by TTL configuration."""
-    raw = os.environ.get("LLM_USAGE_CACHE_TTL")
-    if raw is not None:
-        try:
-            return int(raw) <= 0
-        except ValueError:
-            return False
-    return False
+    value = _env_int("LLM_USAGE_CACHE_TTL")
+    return value is not None and value <= 0
 
 
 def cache_ttl(provider: str | None = None) -> int:
@@ -525,19 +574,10 @@ def cache_ttl(provider: str | None = None) -> int:
     its floor (ANTHROPIC_CACHE_TTL) is double the generic default. An explicit
     LLM_USAGE_CACHE_TTL takes manual control and applies to every provider as-is.
     """
-    if _caching_off():
-        return 0
-
-    def _default() -> int:
-        return ANTHROPIC_CACHE_TTL if provider == "anthropic" else DEFAULT_CACHE_TTL
-
-    raw = os.environ.get("LLM_USAGE_CACHE_TTL")
-    if raw is None:
-        return _default()
-    try:
-        return int(raw)
-    except ValueError:
-        return _default()
+    value = _env_int("LLM_USAGE_CACHE_TTL")
+    if value is not None:
+        return max(0, value)
+    return ANTHROPIC_CACHE_TTL if provider == "anthropic" else DEFAULT_CACHE_TTL
 
 
 def rate_limit_ttl() -> int:
@@ -549,14 +589,8 @@ def rate_limit_ttl() -> int:
     """
     if _caching_off():
         return 0
-    raw = os.environ.get("LLM_USAGE_RATE_LIMIT_TTL")
-    if raw is None:
-        return DEFAULT_RATE_LIMIT_TTL
-    try:
-        v = int(raw)
-        return v if v > 0 else DEFAULT_RATE_LIMIT_TTL
-    except ValueError:
-        return DEFAULT_RATE_LIMIT_TTL
+    value = _env_int("LLM_USAGE_RATE_LIMIT_TTL")
+    return value if value is not None and value > 0 else DEFAULT_RATE_LIMIT_TTL
 
 
 def _cache_dir() -> str:
@@ -577,10 +611,8 @@ def cache_read(provider: str) -> tuple[int | None, Any, float] | None:
     """
     if _CACHE_READ_BYPASS or _caching_off():
         return None
-    try:
-        with open(_cache_path(provider)) as f:
-            d = json.load(f)
-    except (OSError, json.JSONDecodeError):
+    d = _read_cache_document(provider)
+    if d is None:
         return None
     ts = d.get("ts")
     if not isinstance(ts, (int, float)):
@@ -593,33 +625,33 @@ def cache_read(provider: str) -> tuple[int | None, Any, float] | None:
     age = now - ts
     if age < 0 or age > ttl:
         return None
-    if provider == "openai" and code == 200:
-        expiry = openai_next_reset_credit_expiry(
-            d.get("body") or {}, require_future=False)
-        if expiry is not None and now >= expiry:
-            return None
-    if provider == "anthropic" and code == 200:
-        grants = anthropic_reset_grants(d.get("body") or {}, now=ts)
-        expiry = grants and grants["next_expires_at"]
+    if code == 200:
+        expiry = usage_valid_until(provider, d.get("body"), ts)
         if expiry is not None and now >= expiry:
             return None
     return code, d.get("body"), age
 
 
+def usage_valid_until(provider: str, body: Any, fetched_at: float
+                      ) -> float | None:
+    """When a successful usage body goes stale regardless of its TTL.
+
+    Both providers report expiring reset allowances: once the earliest one
+    lapses, the cached counts are wrong, so the cache entry and the data
+    refresh deadline both end there.
+    """
+    if not isinstance(body, dict):
+        return None
+    if provider == "openai":
+        return openai_next_reset_credit_expiry(body, require_future=False)
+    grants = anthropic_reset_grants(body, now=fetched_at)
+    return grants["next_expires_at"] if grants else None
+
+
 def cache_write(provider: str, code: int | None, body: Any) -> None:
     """Persist a fetch result. Best-effort: cache I/O never breaks a run."""
-    path = _cache_path(provider)
-    tmp = f"{path}.{os.getpid()}.tmp"
-    try:
-        os.makedirs(_cache_dir(), exist_ok=True)
-        with open(tmp, "w") as f:
-            json.dump({"ts": time.time(), "code": code, "body": body}, f)
-        os.replace(tmp, path)  # atomic — concurrent runs never see a partial
-    except OSError:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+    _write_cache_document(
+        provider, {"ts": time.time(), "code": code, "body": body})
 
 
 def cached_fetch(provider: str, fetch_fn, tok: dict
@@ -634,23 +666,22 @@ def cached_fetch(provider: str, fetch_fn, tok: dict
     """
     hit = cache_read(provider)
     if hit is not None:
-        code, body, age = hit
-        return code, body, age
+        return hit
     code, body = fetch_fn(tok)
     if code in (200, 429) and not _caching_off():
         cache_write(provider, code, body)
     return code, body, None
 
 
-def cache_notice(code: int | None, age: float | None) -> str | None:
-    """Return a dim 'served from cache' header annotation for a cached success.
+def cache_notice(code: int | None, age: float | None) -> dict | None:
+    """A dim 'served from cache' header notice for a cached success.
 
-    Cached 429s are surfaced by the sections' rate-limit branch instead, so
-    this stays quiet for them.
+    Cached 429s are surfaced by the rate-limit notice instead, so this stays
+    quiet for them.
     """
     if age is None or code != 200:
         return None
-    return f"{DIM}[↻ cached {fmt_relative(age)} ago]{RESET}"
+    return seg("↻ cached ", "dim", age, "up", " ago")
 
 
 # ------------------------------------------------------ provider status ----
@@ -670,18 +701,8 @@ def status_ttl() -> int:
     """Persistent public-status cache TTL; zero disables all caching."""
     if _caching_off():
         return 0
-    raw = os.environ.get("LLM_USAGE_STATUS_TTL")
-    if raw is None:
-        return DEFAULT_STATUS_TTL
-    try:
-        value = int(raw)
-        return value if value >= 0 else DEFAULT_STATUS_TTL
-    except ValueError:
-        return DEFAULT_STATUS_TTL
-
-
-def _status_cache_key(provider: str) -> str:
-    return f"status-{provider}"
+    value = _env_int("LLM_USAGE_STATUS_TTL")
+    return value if value is not None and value >= 0 else DEFAULT_STATUS_TTL
 
 
 def _read_cache_document(cache_key: str) -> dict | None:
@@ -701,7 +722,7 @@ def _write_cache_document(cache_key: str, document: dict) -> None:
         os.makedirs(_cache_dir(), exist_ok=True)
         with open(tmp, "w") as f:
             json.dump(document, f)
-        os.replace(tmp, file_path)
+        os.replace(tmp, file_path)  # atomic — concurrent runs never see a partial
     except OSError:
         try:
             os.unlink(tmp)
@@ -753,7 +774,7 @@ def normalize_provider_status(provider: str, body: Any) -> dict | None:
             continue
         component_state = str(
             component.get("status") or "unknown").lower()
-        if component_state not in ("operational",):
+        if component_state != "operational":
             affected.append({
                 "name": str(component.get("name") or "Unknown component"),
                 "status": component_state,
@@ -785,44 +806,44 @@ def provider_status_snapshot(provider: str) -> dict:
     escalating retry deadline so repeated CLI launches cannot hammer the site.
     """
     loaded_at = time.time()
-    cache_key = _status_cache_key(provider)
+    cache_key = f"status-{provider}"
     ttl = status_ttl()
-    cached = (
-        None if ttl <= 0 else _read_cache_document(cache_key)
-    )
-    cached = cached or {}
+    cached = (_read_cache_document(cache_key) if ttl > 0 else None) or {}
     cached_body = cached.get("body")
     cached_ts = cached.get("ts")
     retry_at = cached.get("retry_at")
 
-    if (not _CACHE_READ_BYPASS and isinstance(retry_at, (int, float))
-            and retry_at > loaded_at):
+    def result(body: Any, *, cached_flag: bool, stale: bool,
+               age: float | None, error: str | None, deadline: float) -> dict:
         return {
             "provider": provider,
-            "status": normalize_provider_status(provider, cached_body),
-            "cached": cached_body is not None,
-            "stale": True,
-            "age": (max(0.0, loaded_at - cached_ts)
-                    if isinstance(cached_ts, (int, float)) else None),
-            "error": cached.get("last_error") or "status refresh failed",
+            "status": normalize_provider_status(provider, body),
+            "cached": cached_flag,
+            "stale": stale,
+            "age": age,
+            "error": error,
             "loaded_at": loaded_at,
-            "deadline": float(retry_at),
+            "deadline": deadline,
         }
+
+    def stale_result(error: str, deadline: float) -> dict:
+        age = (max(0.0, loaded_at - cached_ts)
+               if isinstance(cached_ts, (int, float)) else None)
+        return result(cached_body, cached_flag=cached_body is not None,
+                      stale=True, age=age, error=error, deadline=deadline)
+
+    if (not _CACHE_READ_BYPASS and isinstance(retry_at, (int, float))
+            and retry_at > loaded_at):
+        return stale_result(cached.get("last_error") or "status refresh failed",
+                            float(retry_at))
 
     if (not _CACHE_READ_BYPASS and ttl > 0
             and isinstance(cached_ts, (int, float))
             and loaded_at >= cached_ts
             and loaded_at - cached_ts <= ttl):
-        return {
-            "provider": provider,
-            "status": normalize_provider_status(provider, cached_body),
-            "cached": True,
-            "stale": False,
-            "age": loaded_at - cached_ts,
-            "error": None,
-            "loaded_at": loaded_at,
-            "deadline": cached_ts + ttl,
-        }
+        return result(cached_body, cached_flag=True, stale=False,
+                      age=loaded_at - cached_ts, error=None,
+                      deadline=cached_ts + ttl)
 
     headers = {
         "Accept": "application/json",
@@ -833,55 +854,29 @@ def provider_status_snapshot(provider: str) -> dict:
     code, body, response_headers = http_get_json_response(
         STATUS_URLS[provider], headers)
 
-    if code == 304 and cached_body is not None:
-        document = {
-            "ts": loaded_at,
-            "body": cached_body,
-            "etag": response_headers.get("etag") or cached.get("etag"),
-            "failures": 0,
-            "retry_at": None,
-            "last_error": None,
-        }
+    not_modified = code == 304 and cached_body is not None
+    if not_modified or (
+            code == 200 and normalize_provider_status(provider, body) is not None):
+        fresh_body = cached_body if not_modified else body
+        etag = response_headers.get("etag")
+        if not_modified:
+            etag = etag or cached.get("etag")
         if ttl > 0:
-            _write_cache_document(cache_key, document)
-        return {
-            "provider": provider,
-            "status": normalize_provider_status(provider, cached_body),
-            "cached": True,
-            "stale": False,
-            "age": 0.0,
-            "error": None,
-            "loaded_at": loaded_at,
-            "deadline": loaded_at + max(1, ttl or DEFAULT_STATUS_TTL),
-        }
-
-    normalized = normalize_provider_status(provider, body)
-    if code == 200 and normalized is not None:
-        document = {
-            "ts": loaded_at,
-            "body": body,
-            "etag": response_headers.get("etag"),
-            "failures": 0,
-            "retry_at": None,
-            "last_error": None,
-        }
-        if ttl > 0:
-            _write_cache_document(cache_key, document)
-        return {
-            "provider": provider,
-            "status": normalized,
-            "cached": False,
-            "stale": False,
-            "age": None,
-            "error": None,
-            "loaded_at": loaded_at,
-            "deadline": loaded_at + max(1, ttl or DEFAULT_STATUS_TTL),
-        }
+            _write_cache_document(cache_key, {
+                "ts": loaded_at,
+                "body": fresh_body,
+                "etag": etag,
+                "failures": 0,
+                "retry_at": None,
+                "last_error": None,
+            })
+        return result(fresh_body, cached_flag=not_modified, stale=False,
+                      age=0.0 if not_modified else None, error=None,
+                      deadline=loaded_at + max(1, ttl or DEFAULT_STATUS_TTL))
 
     failures = max(0, int(cached.get("failures") or 0)) + 1
-    retry_seconds = _status_retry_seconds(
+    retry_at = loaded_at + _status_retry_seconds(
         failures, response_headers.get("retry-after"), loaded_at)
-    retry_at = loaded_at + retry_seconds
     error = _status_error_text(code, body)
     if ttl > 0:
         document = dict(cached)
@@ -892,37 +887,19 @@ def provider_status_snapshot(provider: str) -> dict:
             "last_attempt": loaded_at,
         })
         _write_cache_document(cache_key, document)
-    return {
-        "provider": provider,
-        "status": normalize_provider_status(provider, cached_body),
-        "cached": cached_body is not None,
-        "stale": True,
-        "age": (max(0.0, loaded_at - cached_ts)
-                if isinstance(cached_ts, (int, float)) else None),
-        "error": error,
-        "loaded_at": loaded_at,
-        "deadline": retry_at,
-    }
+    return stale_result(error, retry_at)
 
 
 def provider_status_json(snapshot: dict | None) -> dict:
     snapshot = snapshot or {}
     normalized = snapshot.get("status")
+    status = normalized or {}
     return {
         "available": normalized is not None,
-        "operational": (
-            normalized.get("operational") if normalized is not None else None
-        ),
-        "indicator": (
-            normalized.get("indicator") if normalized is not None else None
-        ),
-        "description": (
-            normalized.get("description") if normalized is not None else None
-        ),
-        "affected_components": (
-            normalized.get("affected_components")
-            if normalized is not None else []
-        ),
+        "operational": status.get("operational"),
+        "indicator": status.get("indicator"),
+        "description": status.get("description"),
+        "affected_components": status.get("affected_components", []),
         "cached": bool(snapshot.get("cached")),
         "stale": bool(snapshot.get("stale")),
         "cache_age_seconds": snapshot.get("age"),
@@ -931,38 +908,46 @@ def provider_status_json(snapshot: dict | None) -> dict:
     }
 
 
-def provider_status_line(snapshot: dict | None) -> str | None:
+def service_status_segment(snapshot: dict | None) -> dict | None:
+    """The public-status line for a provider, or None when all is well."""
     snapshot = snapshot or {}
     normalized = snapshot.get("status")
     stale = bool(snapshot.get("stale"))
     error = snapshot.get("error")
+    link = STATUS_PAGE_URLS.get(str(snapshot.get("provider") or ""))
     if normalized is None:
         if error:
-            return (f"  {fg256(214)}? Service status unavailable "
-                    f"({error}){RESET}")
+            return seg(f"? Service status unavailable ({error})", "warn",
+                       link=link)
         return None
 
     if normalized.get("operational") and not stale:
         return None
     indicator = normalized.get("indicator")
     if indicator in ("major", "critical"):
-        color = fg256(203)
+        tone = "critical"
     elif indicator == "minor":
-        color = fg256(214)
+        tone = "warn"
     else:
-        color = fg256(186)
+        tone = "caution"
     text = str(normalized.get("description") or "Service disruption")
-    if stale:
-        age = snapshot.get("age")
-        confirmed = (
-            f", last confirmed {fmt_relative(age)} ago"
-            if isinstance(age, (int, float)) else ", last confirmed earlier"
-        )
-        if normalized.get("operational"):
-            return (f"  {fg256(214)}? Service status unavailable; "
-                    f"last known: {text}{confirmed}{RESET}")
-        text += confirmed
-    return f"  {color}● Service status: {text}{RESET}"
+    if not stale:
+        return seg(f"● Service status: {text}", tone, link=link)
+    if normalized.get("operational"):
+        text = f"? Service status unavailable; last known: {text}"
+        tone = "warn"
+    else:
+        text = f"● Service status: {text}"
+    age = snapshot.get("age")
+    if isinstance(age, (int, float)):
+        return seg(f"{text}, last confirmed ", tone, age, "up", " ago",
+                   link=link)
+    return seg(f"{text}, last confirmed earlier", tone, link=link)
+
+
+def provider_status_line(snapshot: dict | None) -> str | None:
+    segment = service_status_segment(snapshot)
+    return "  " + seg_ansi(segment) if segment else None
 
 
 # ----------------------------------------------------------- bar render ----
@@ -1023,7 +1008,7 @@ def fmt_relative(seconds: float | None) -> str:
 def fmt_window(seconds: int) -> str:
     if seconds % 86400 == 0 and seconds >= 86400:
         d = seconds // 86400
-        return f"{d}-day" if d > 1 else "1-day"
+        return f"{d}-day"
     if seconds % 3600 == 0:
         h = seconds // 3600
         return f"{h}-hour"
@@ -1032,52 +1017,86 @@ def fmt_window(seconds: int) -> str:
 
 # ------------------------------------------------------------------ row ----
 
-def label_width(width: int) -> int:
-    if width < 46:
-        return 10
-    if width < 72:
-        return 14
-    return 18
+LABEL_GAP_W = 2
+BAR_GAP_W = 1
+OVERFLOW_W = 2
 
 
-def row_layout_widths(labels: list[str], usage_pcts: list[float],
-                      width: int) -> tuple[int, int]:
-    label_gap_w = 2
-    bar_gap_w = 1
-    overflow_w = 2
-    min_bar = 4 if width < 46 else 8
-    pct_w = max((len(f"{pct:.0f}%") for pct in usage_pcts), default=3)
+def min_bar_width(width: int) -> int:
+    return 4 if width < 46 else 8
+
+
+def window_elapsed_pct(window_seconds: float | None,
+                       remaining_seconds: float | None) -> float | None:
+    """Percent of a limit window already elapsed, clamped to 0-100."""
+    if not window_seconds or remaining_seconds is None:
+        return None
+    return max(0.0, min(
+        100.0, (window_seconds - remaining_seconds) / window_seconds * 100))
+
+
+def pace_verdict(usage_pct: float, now_pct: float | None) -> str | None:
+    """'over', 'under', or 'on' pace (±5pp of elapsed window), else None."""
+    if now_pct is None:
+        return None
+    if usage_pct >= now_pct + 5:
+        return "over"
+    if usage_pct <= now_pct - 5:
+        return "under"
+    return "on"
+
+
+def usage_row(label: str, utilization: float, window_seconds: float | None,
+              reset_seconds: float | None) -> dict:
+    """A view row: one limit window with its severity and pace verdict."""
+    now_pct = window_elapsed_pct(window_seconds, reset_seconds)
+    return {
+        "type": "row",
+        "label": label,
+        "utilization": utilization,
+        "severity": severity_tone(utilization),
+        "window_seconds": window_seconds,
+        "reset_seconds": reset_seconds,
+        "now_pct": now_pct,
+        "pace": pace_verdict(utilization, now_pct),
+    }
+
+
+def row_layout_widths(rows: list[dict], width: int) -> tuple[int, int]:
+    """Shared (label, percent) column widths for a section's view rows."""
+    pct_w = max((len(f"{r['utilization']:.0f}%") for r in rows), default=3)
     max_label_w = max(
         1,
-        width - label_gap_w - pct_w - bar_gap_w - overflow_w - min_bar,
+        width - LABEL_GAP_W - pct_w - BAR_GAP_W - OVERFLOW_W
+        - min_bar_width(width),
     )
-    if not labels:
-        return min(label_width(width), max_label_w), pct_w
-    return min(max(len(label) for label in labels), max_label_w), pct_w
+    return min(max((len(r["label"]) for r in rows), default=1),
+               max_label_w), pct_w
 
 
-def row(label: str, usage_pct: float, now_pct: float | None,
-        reset_dt: datetime | None, reset_seconds: float | None,
-        width: int, label_w: int | None = None,
-        pct_w: int | None = None) -> str:
-    label_w = label_width(width) if label_w is None else label_w
+PACE_STYLES = {
+    "over": (TONES["critical"], "↑", "over pace"),
+    "under": (TONES["good"], "↓", "under pace"),
+    "on": (WHITE, None, "on pace"),
+}
+
+
+def row(r: dict, width: int, label_w: int, pct_w: int) -> str:
+    label, usage_pct = r["label"], r["utilization"]
+    now_pct, reset_seconds = r["now_pct"], r["reset_seconds"]
     raw_label = fit_text(label, label_w)
-    label_gap_w = 2
-    label_col_w = label_w + label_gap_w
+    label_col_w = label_w + LABEL_GAP_W
     pct_text = f"{usage_pct:.0f}%"
-    pct_col_w = max(pct_w if pct_w is not None else 0, len(pct_text))
+    pct_col_w = max(pct_w, len(pct_text))
     pct_str = f"{pct_text:>{pct_col_w}}"
-    bar_gap_w = 1
-    overflow_w = 2
-    min_bar = 4 if width < 46 else 8
-    bar_w = max(min_bar,
-                width - label_col_w - pct_col_w - bar_gap_w - overflow_w)
+    bar_w = max(min_bar_width(width),
+                width - label_col_w - pct_col_w - BAR_GAP_W - OVERFLOW_W)
     bar, overflow = render_bar(bar_w, usage_pct)
-    lbl = f"{BOLD}{raw_label:<{label_w}}{RESET}{' ' * label_gap_w}"
+    lbl = f"{BOLD}{raw_label:<{label_w}}{RESET}{' ' * LABEL_GAP_W}"
     pct_color = color_for_pct(usage_pct)
     overflow_mark = f" {fg256(203)}↑{RESET}" if overflow else "  "
     line1 = f"{lbl}{pct_color}{pct_str}{RESET} {bar}{overflow_mark}"
-    bar_start = label_col_w + pct_col_w + bar_gap_w
+    bar_start = label_col_w + pct_col_w + BAR_GAP_W
 
     line0 = ""
     countdown_text = (
@@ -1086,64 +1105,42 @@ def row(label: str, usage_pct: float, now_pct: float | None,
     )
     if now_pct is not None:
         margin = usage_pct - now_pct
-        if usage_pct >= now_pct + 5:
-            pace_color = fg256(203)
-            verdict = "over pace"
-        elif usage_pct <= now_pct - 5:
-            pace_color = fg256(78)
-            verdict = "under pace"
-        else:
-            pace_color = WHITE
-            verdict = "on pace"
-        if verdict == "on pace":
+        pace_color, arrow, verdict = PACE_STYLES[r["pace"]]
+        if arrow is None:
             pace_text = "≈ on pace"
         elif width < 64:
-            arrow = "↑" if verdict == "over pace" else "↓"
             pace_text = f"{arrow} {margin:+.0f}pp"
         else:
-            arrow = "↑" if verdict == "over pace" else "↓"
             pace_text = f"{arrow} {margin:+.0f}pp {verdict}"
         now_idx = min(max(0, round(now_pct / 100 * bar_w)), bar_w - 1)
         marker_col = bar_start + now_idx
         now_label = f"{now_pct:.0f}%"
         marker_pad = "  "
         segment_sep = " · "
-        left_segments = []
-        right_segments = []
 
-        def joined_text(segments: list[tuple[str, str]]) -> str:
-            return segment_sep.join(text for text, _color in segments)
+        def joined_len(segments: list[tuple[str, str]]) -> int:
+            return (sum(len(text) for text, _color in segments)
+                    + len(segment_sep) * (len(segments) - 1))
 
-        def left_text(segments: list[tuple[str, str]]) -> str:
-            if segments:
-                return now_label + " " + joined_text(segments) + marker_pad
-            return now_label + marker_pad
-
-        def right_text(segments: list[tuple[str, str]]) -> str:
-            if segments:
-                return marker_pad + joined_text(segments)
-            return ""
-
+        # Each segment goes right of the marker when it fits, else left.
+        left_segments: list[tuple[str, str]] = []
+        right_segments: list[tuple[str, str]] = []
         right_capacity = width - marker_col - len(NOW_MARK)
         for segment in [(pace_text, pace_color), (countdown_text, SUB_FG)]:
-            text, color = segment
-            if not text:
+            if not segment[0]:
                 continue
-            candidate = right_segments + [(text, color)]
-            if len(right_text(candidate)) <= right_capacity:
+            candidate = right_segments + [segment]
+            if len(marker_pad) + joined_len(candidate) <= right_capacity:
                 right_segments = candidate
                 continue
-            candidate = left_segments + [(text, color)]
-            if len(left_text(candidate)) <= marker_col:
+            candidate = left_segments + [segment]
+            if (len(now_label) + 1 + joined_len(candidate)
+                    + len(marker_pad)) <= marker_col:
                 left_segments = candidate
 
         def colored_segments(segments: list[tuple[str, str]]) -> str:
-            out = []
-            for i, (text, color) in enumerate(segments):
-                if i:
-                    out.append(SUB_FG + segment_sep + RESET)
-                out.append(color + text + RESET)
-            return "".join(out)
+            return (SUB_FG + segment_sep + RESET).join(
+                color + text + RESET for text, color in segments)
 
         left = pace_color + now_label + RESET
         if left_segments:
@@ -1176,7 +1173,7 @@ def section_header(title: str, plan: str, width: int,
     if plan and width >= 48:
         left_parts.append(f"{DIM}{plan}{RESET}")
     notice_parts = [n for n in (notices or []) if n]
-    now_str = datetime.now().astimezone().strftime("%a %b %d %H:%M %Z")
+    now_str = fmt_local(datetime.now(timezone.utc))
     if width < 48:
         left_parts.extend(notice_parts)
         left = "  ".join(left_parts)
@@ -1203,39 +1200,33 @@ def warn_line(msg: str) -> str:
     return f"  {fg256(203)}✖ {msg}{RESET}"
 
 
-def rate_limit_notice(age: float | None) -> str:
+def rate_limit_notice(age: float | None) -> dict:
     """Report a 429 backoff. age=None means we hit it live this render."""
-    if age is None:
-        return (f"{fg256(214)}[● rate limited (429), retry in "
-                f"{fmt_relative(rate_limit_ttl())}]{RESET}")
-    remaining = max(0.0, rate_limit_ttl() - age)
-    return (f"{fg256(214)}[● rate limited (429), retry in "
-            f"{fmt_relative(remaining)}]{RESET}")
+    remaining = max(0.0, rate_limit_ttl() - (age or 0.0))
+    return seg("● rate limited (429), retry in ", "warn", remaining)
 
 
-def token_expiry_notice(expires_at_ms: int | None) -> tuple[str | None, bool]:
-    """Return an OAuth-expiry header annotation and whether it is expired."""
+def token_expiry_notice(expires_at_ms: int | None
+                        ) -> tuple[dict | None, bool]:
+    """Return an OAuth-expiry header notice and whether it is expired."""
     if expires_at_ms is None:
         return None, False
     exp = datetime.fromtimestamp(expires_at_ms / 1000, tz=timezone.utc)
     secs = (exp - datetime.now(timezone.utc)).total_seconds()
     if secs <= 0:
-        return (f"{fg256(203)}[✖ OAuth expired {fmt_relative(-secs)} "
-                f"ago]{RESET}", True)
+        return seg("✖ OAuth expired ", "critical", -secs, "up", " ago"), True
     if secs > 4 * 3600:
         return None, False
-    if secs < 3600:
-        color = fg256(203)
-    else:
-        color = fg256(214)
-    return (f"{color}[⚠ OAuth expires in {fmt_relative(secs)}]{RESET}", False)
+    tone = "critical" if secs < 3600 else "warn"
+    return seg("⚠ OAuth expires in ", tone, secs), False
 
 
 # ------------------------------------------------------------- sections ----
 
 def next_data_refresh_deadline(code: int | None, age: float | None,
                                loaded_at: float,
-                               provider: str | None = None) -> float:
+                               provider: str | None = None,
+                               body: Any = None) -> float:
     if code == 200:
         ttl = cache_ttl(provider)
     elif code == 429:
@@ -1244,7 +1235,14 @@ def next_data_refresh_deadline(code: int | None, age: float | None,
         return loaded_at + DEFAULT_TUI_RETRY_SECONDS
     if ttl <= 0:
         return loaded_at + DEFAULT_TUI_RETRY_SECONDS
-    return loaded_at + max(1.0, ttl - (age or 0.0))
+    deadline = loaded_at + max(1.0, ttl - (age or 0.0))
+    if code == 200 and provider:
+        expiry = usage_valid_until(provider, body, loaded_at - (age or 0.0))
+        # A lapsed expiry the server still reports must not force a refetch
+        # on every tick; only a future one shortens the deadline.
+        if expiry is not None and expiry > loaded_at:
+            deadline = min(deadline, expiry)
+    return deadline
 
 
 def snapshot_elapsed(snapshot: dict) -> float:
@@ -1528,12 +1526,12 @@ def anthropic_reset_grants(body: dict, now: float | None = None
     }
 
 
-def anthropic_reset_parts(body: dict) -> list[str]:
-    """Extras segments for banked usage-limit resets."""
+def anthropic_reset_parts(body: dict) -> list[list[dict]]:
+    """Extras parts for banked usage-limit resets."""
     grants = anthropic_reset_grants(body)
     if not grants or not grants["available_count"]:
         return []
-    parts = [reset_credit_text(grants["available_count"],
+    parts = [reset_credit_part(grants["available_count"],
                                grants["next_expires_at"])]
     if not grants["usable_now"]:
         cooldown = _aware_epoch(grants.get("cooldown_until"))
@@ -1543,18 +1541,27 @@ def anthropic_reset_parts(body: dict) -> list[str]:
             text = "usable once limited"
         else:
             text = "not usable now"
-        parts.append(f"{fg256(214)}{text}{RESET}")
+        parts.append([seg(text, "warn")])
     return parts
 
 
-def anthropic_extras_line(body: dict) -> str | None:
-    parts = anthropic_spend_parts(body) + anthropic_reset_parts(body)
+def extras_line(parts: list[list[dict]]) -> str | None:
+    """Terminal 'Extras:' line; each part is a run of adjacent segments."""
     if not parts:
         return None
-    return f"  {DIM}Extras:{RESET} " + (SUB_FG + " · " + RESET).join(parts)
+    return f"  {DIM}Extras:{RESET} " + (SUB_FG + " · " + RESET).join(
+        "".join(seg_ansi(segment) for segment in part) for part in parts)
 
 
-def anthropic_spend_parts(body: dict) -> list[str]:
+def anthropic_extras_parts(body: dict) -> list[list[dict]]:
+    return anthropic_spend_parts(body) + anthropic_reset_parts(body)
+
+
+def anthropic_extras_line(body: dict) -> str | None:
+    return extras_line(anthropic_extras_parts(body))
+
+
+def anthropic_spend_parts(body: dict) -> list[list[dict]]:
     spend = normalize_anthropic_spend(body)
     if not spend:
         return []
@@ -1571,17 +1578,17 @@ def anthropic_spend_parts(body: dict) -> list[str]:
 
     parts = []
     if spend["enabled"]:
-        parts.append(f"{fg256(78)}usage credits on{RESET}")
+        parts.append([seg("usage credits on", "good")])
     else:
-        parts.append(f"{SUB_FG}usage credits off{RESET}")
+        parts.append([seg("usage credits off", "sub")])
     used = format_money(spend.get("used"))
     limit = format_money(spend.get("limit"))
     if used and limit:
-        parts.append(f"{SUB_FG}{used} / {limit}{RESET}")
+        parts.append([seg(f"{used} / {limit}", "sub")])
     if reason and reason not in ("disabled", "not_enabled"):
-        parts.append(f"{fg256(214)}{str(reason).replace('_', ' ')}{RESET}")
+        parts.append([seg(str(reason).replace("_", " "), "warn")])
     if actionable_severity:
-        parts.append(f"{fg256(214)}{str(severity).replace('_', ' ')}{RESET}")
+        parts.append([seg(str(severity).replace("_", " "), "warn")])
     return parts
 
 
@@ -1596,81 +1603,13 @@ def anthropic_snapshot() -> dict:
     code, body, age = cached_fetch("anthropic", fetch_anthropic, tok)
     return {"provider": "anthropic", "token": tok, "code": code,
             "body": body, "age": age, "loaded_at": loaded_at,
-            "deadline": next_data_refresh_deadline(code, age, loaded_at,
-                                                   "anthropic")}
+            "deadline": next_data_refresh_deadline(
+                code, age, loaded_at, "anthropic", body)}
 
 
-def render_anthropic_section(snapshot: dict, width: int) -> tuple[list[str], bool]:
-    """Render the Anthropic section. Returns lines plus success state."""
-    lines = []
-    tok = snapshot.get("token")
-    if not tok or not tok.get("access_token"):
-        lines.extend(section_header("ANTHROPIC", "Claude", width))
-        service_line = provider_status_line(snapshot.get("service_status"))
-        if service_line:
-            lines.append(service_line)
-        lines.append(warn_line("no OAuth token "
-                               "(set $CLAUDE_CODE_OAUTH_TOKEN or run `claude` "
-                               "to login)"))
-        return [clip_ansi(line, width) for line in lines], False
-
-    code = snapshot.get("code")
-    body = snapshot.get("body") or {}
-    expiry, expired = token_expiry_notice(tok.get("expires_at_ms"))
-    if code == 429:
-        status = rate_limit_notice(
-            displayed_cache_age(snapshot, include_live_429=True))
-    else:
-        status = cache_notice(code, displayed_cache_age(snapshot))
-    plan_label = (tok.get("subscription") or "").title()
-    lines.extend(section_header(
-        "ANTHROPIC",
-        f"Claude {plan_label} Plan" if plan_label else "Claude",
-        width,
-        [status, expiry],
-    ))
-    service_line = provider_status_line(snapshot.get("service_status"))
-    if service_line:
-        lines.append(service_line)
-    if code == 401:
-        lines.append(warn_line("token rejected (401)"
-                               + (" — expired" if expired else "")
-                               + "; run `claude` to refresh"))
-        return [clip_ansi(line, width) for line in lines], False
-    if code == 429:
-        return [clip_ansi(line, width) for line in lines], False
-    if code != 200:
-        lines.append(warn_line(f"API error {code}: {json.dumps(body)[:200]}"))
-        return [clip_ansi(line, width) for line in lines], False
-
-    extras_line = anthropic_extras_line(body)
-    if extras_line:
-        lines.append(extras_line)
-
-    now = datetime.now(timezone.utc)
-    bands = anthropic_limit_bands(body)
-    label_w, pct_w = row_layout_widths(
-        [band["label"] for band in bands],
-        [band["utilization"] for band in bands],
-        width,
-    )
-    printed = 0
-    for band in bands:
-        usage = band["utilization"]
-        reset_dt = parse_iso(band.get("resets_at"))
-        if reset_dt:
-            rem = (reset_dt - now).total_seconds()
-            window_s = band["window_seconds"]
-            now_pct = max(0.0, min(100.0, (window_s - rem) / window_s * 100))
-        else:
-            rem = None
-            now_pct = None
-        lines.extend(row(band["label"], usage, now_pct, reset_dt, rem, width,
-                         label_w, pct_w).splitlines())
-        printed += 1
-    if not printed:
-        lines.append(f"  {DIM}(no usage data){RESET}")
-    return [clip_ansi(line, width) for line in lines], True
+def render_anthropic_section(snapshot: dict, width: int
+                             ) -> tuple[list[str], bool]:
+    return render_provider_section(provider_view("anthropic", snapshot), width)
 
 
 def openai_snapshot() -> dict:
@@ -1682,14 +1621,10 @@ def openai_snapshot() -> dict:
                 "deadline": loaded_at + DEFAULT_TUI_RETRY_SECONDS}
 
     code, body, age = cached_fetch("openai", fetch_codex, tok)
-    deadline = next_data_refresh_deadline(code, age, loaded_at, "openai")
-    if code == 200 and isinstance(body, dict):
-        expiry = openai_next_reset_credit_expiry(body)
-        if expiry is not None:
-            deadline = min(deadline, expiry)
     return {"provider": "openai", "token": tok, "code": code,
             "body": body, "age": age, "loaded_at": loaded_at,
-            "deadline": deadline}
+            "deadline": next_data_refresh_deadline(
+                code, age, loaded_at, "openai", body)}
 
 
 def adjusted_openai_reset_seconds(snapshot: dict, window: dict
@@ -1705,11 +1640,9 @@ def adjusted_openai_reset_seconds(snapshot: dict, window: dict
     return max(0.0, float(rem_s) - cache_age - snapshot_elapsed(snapshot))
 
 
-def openai_window_rows(snapshot: dict, rate_limit: dict
-                       ) -> list[tuple[str, float, float | None,
-                                       datetime | None, float | None]]:
-    """Normalize an OpenAI rate-limit object into dashboard rows."""
-    rows = []
+def openai_bands(snapshot: dict, rate_limit: dict) -> list[dict]:
+    """Normalize an OpenAI rate-limit object's windows, weekly first."""
+    bands = []
     for key, default_label in [
         ("secondary_window", "secondary"),
         ("primary_window", "primary"),
@@ -1717,24 +1650,19 @@ def openai_window_rows(snapshot: dict, rate_limit: dict
         window = rate_limit.get(key)
         if not window:
             continue
-        usage = float(window.get("used_percent", 0))
         window_s = window.get("limit_window_seconds")
-        remaining_s = adjusted_openai_reset_seconds(snapshot, window)
-        if window_s and remaining_s is not None:
-            now_pct = max(0.0, min(
-                100.0,
-                (window_s - remaining_s) / window_s * 100,
-            ))
-        else:
-            now_pct = None
-        reset_at = window.get("reset_at")
-        reset_dt = (datetime.fromtimestamp(reset_at, tz=timezone.utc)
-                    if reset_at else None)
         label = fmt_window(window_s) if window_s else default_label
         if key == "secondary_window":
             label = f"{label} (weekly)"
-        rows.append((label, usage, now_pct, reset_dt, remaining_s))
-    return rows
+        bands.append({
+            "key": key,
+            "label": label,
+            "utilization": float(window.get("used_percent", 0)),
+            "reset_seconds": adjusted_openai_reset_seconds(snapshot, window),
+            "reset_at": window.get("reset_at"),
+            "window_seconds": window_s,
+        })
+    return bands
 
 
 def openai_reset_credit_count(body: dict) -> int:
@@ -1758,32 +1686,30 @@ def openai_reset_credit_count(body: dict) -> int:
     return 0
 
 
-def openai_reset_credit_details_complete(body: dict) -> bool:
-    """Whether detail rows cover every available reset credit."""
-    reset_credits = body.get("rate_limit_reset_credits") or {}
-    credits = reset_credits.get("credits")
+def _available_reset_credit_rows(body: dict) -> list[dict] | None:
+    """Available per-credit detail rows, or None when no detail list exists."""
+    credits = (body.get("rate_limit_reset_credits") or {}).get("credits")
     if not isinstance(credits, list):
-        return False
-    available = [
+        return None
+    return [
         credit for credit in credits
         if isinstance(credit, dict)
         and credit.get("status") in (None, "available")
     ]
-    return len(available) == openai_reset_credit_count(body)
+
+
+def openai_reset_credit_details_complete(body: dict) -> bool:
+    """Whether detail rows cover every available reset credit."""
+    available = _available_reset_credit_rows(body)
+    return (available is not None
+            and len(available) == openai_reset_credit_count(body))
 
 
 def openai_next_reset_credit_expiry(
         body: dict, require_future: bool = True) -> float | None:
     """Return the earliest expiry only when all available rows are complete."""
-    if not openai_reset_credit_details_complete(body):
-        return None
-    reset_credits = body.get("rate_limit_reset_credits") or {}
-    available = [
-        credit for credit in reset_credits.get("credits") or []
-        if isinstance(credit, dict)
-        and credit.get("status") in (None, "available")
-    ]
-    if not available:
+    available = _available_reset_credit_rows(body)
+    if not available or len(available) != openai_reset_credit_count(body):
         return None
     expiries = [credit.get("expires_at") for credit in available]
     if any(not isinstance(value, (int, float)) or isinstance(value, bool)
@@ -1796,63 +1722,63 @@ def openai_next_reset_credit_expiry(
 
 
 def fmt_reset_credit_expiry(expires_at: float) -> str:
-    dt = datetime.fromtimestamp(expires_at, tz=timezone.utc).astimezone()
-    return dt.strftime("%a %b %d %H:%M %Z")
+    return fmt_local(datetime.fromtimestamp(expires_at, tz=timezone.utc))
 
 
-def reset_credit_text(count: int, next_expiry: float | None) -> str:
-    """'N usage resets' plus an urgency-colored next-expiry clause."""
+def reset_credit_part(count: int, next_expiry: float | None) -> list[dict]:
+    """'N usage resets' plus an urgency-toned next-expiry clause."""
     noun = "reset" if count == 1 else "resets"
-    text = f"{fg256(78)}{count} usage {noun}{RESET}"
+    part = [seg(f"{count} usage {noun}", "good")]
     if next_expiry is None:
-        return text
+        return part
     remaining = next_expiry - time.time()
     if remaining <= 4 * 3600:
-        expiry_color = fg256(203)
+        tone = "critical"
     elif remaining <= 24 * 3600:
-        expiry_color = fg256(214)
+        tone = "warn"
     elif remaining <= 3 * 86400:
-        expiry_color = fg256(186)
+        tone = "caution"
     else:
-        expiry_color = SUB_FG
+        tone = "sub"
+    when = fmt_reset_credit_expiry(next_expiry)
     if remaining <= 3 * 86400:
-        when = (f"in {fmt_relative(remaining)} "
-                f"({fmt_reset_credit_expiry(next_expiry)})")
+        expiry = seg("next expires in ", tone, remaining, after=f" ({when})")
     else:
-        when = fmt_reset_credit_expiry(next_expiry)
-    return text + f"{SUB_FG}, {RESET}{expiry_color}next expires {when}{RESET}"
+        expiry = seg(f"next expires {when}", tone)
+    return part + [seg(", ", "sub"), expiry]
 
 
-def openai_credit_status_line(body: dict) -> str | None:
+def openai_extras_parts(body: dict) -> list[list[dict]]:
     """Compact, read-only status for purchased and usage-reset credits."""
     parts = []
     credits = body.get("credits") or {}
     if credits.get("unlimited"):
-        parts.append(f"{fg256(78)}credits unlimited{RESET}")
+        parts.append([seg("credits unlimited", "good")])
     elif credits.get("overage_limit_reached"):
-        parts.append(f"{fg256(203)}credit limit reached{RESET}")
+        parts.append([seg("credit limit reached", "critical")])
     elif credits.get("has_credits"):
         balance = credits.get("balance")
         text = (f"credit balance {balance}"
                 if balance not in (None, "") else "credits available")
-        parts.append(f"{fg256(78)}{text}{RESET}")
+        parts.append([seg(text, "good")])
 
     reset_count = openai_reset_credit_count(body)
     if reset_count:
-        parts.append(reset_credit_text(
+        parts.append(reset_credit_part(
             reset_count, openai_next_reset_credit_expiry(body)))
-    if not parts:
-        return None
-    return f"  {DIM}Extras:{RESET} " + (SUB_FG + " · " + RESET).join(parts)
+    return parts
 
 
-def openai_additional_rate_limits(body: dict
-                                  ) -> list[tuple[str, dict, str | None]]:
+def openai_credit_status_line(body: dict) -> str | None:
+    return extras_line(openai_extras_parts(body))
+
+
+def openai_additional_rate_limits(body: dict) -> list[dict]:
     """Return named model/feature-specific rate-limit groups.
 
-    Each tuple is (display title, rate_limit object, metered feature). The
-    title is the user-facing name from `openai_limit_display_name`; the raw
-    `limit_name` is still available on the `--json` surface as `name`.
+    Each group carries the raw `name` (limit_name or metered feature), the
+    user-facing `display_name` from `openai_limit_display_name`, the metered
+    feature, the reserve model slug, and the raw `rate_limit` object.
     """
     groups = []
     for item in body.get("additional_rate_limits") or []:
@@ -1862,14 +1788,17 @@ def openai_additional_rate_limits(body: dict
         if not isinstance(rate_limit, dict):
             continue
         feature = item.get("metered_feature")
-        title = item.get("limit_name") or feature or "Additional limit"
         feature_str = str(feature) if feature is not None else None
-        groups.append((
-            openai_limit_display_name(str(title), feature_str,
-                                      item.get("normal_model_slug")),
-            rate_limit,
-            feature_str,
-        ))
+        name = item.get("limit_name") or feature_str or "Additional limit"
+        model_slug = item.get("normal_model_slug")
+        groups.append({
+            "name": name,
+            "display_name": openai_limit_display_name(
+                str(name), feature_str, model_slug),
+            "metered_feature": feature_str,
+            "normal_model_slug": model_slug,
+            "rate_limit": rate_limit,
+        })
     return groups
 
 
@@ -1913,107 +1842,17 @@ def openai_limit_in_use(rate_limit: dict) -> bool:
     return False
 
 
-def openai_limit_heading(title: str, rate_limit: dict) -> str:
-    status = ""
+def openai_limit_badges(rate_limit: dict) -> list[dict]:
     if rate_limit.get("limit_reached"):
-        status = f"  {fg256(203)}● limit reached{RESET}"
-    elif not rate_limit.get("allowed", True):
-        status = f"  {fg256(214)}⚠ not currently allowed{RESET}"
-    return f"  {DIM}{title}{RESET}{status}"
+        return [seg("● limit reached", "critical")]
+    if not rate_limit.get("allowed", True):
+        return [seg("⚠ not currently allowed", "warn")]
+    return []
 
 
 def render_openai_section(snapshot: dict, width: int
                           ) -> tuple[list[str], bool]:
-    """Render the OpenAI section. Returns lines plus success state."""
-    lines = []
-    tok = snapshot.get("token")
-    if not tok or not tok.get("access_token"):
-        lines.extend(section_header("OPENAI", "ChatGPT", width))
-        service_line = provider_status_line(snapshot.get("service_status"))
-        if service_line:
-            lines.append(service_line)
-        lines.append(warn_line("no OAuth token "
-                               "(set $CODEX_OAUTH_TOKEN or run `codex` "
-                               "to login)"))
-        return [clip_ansi(line, width) for line in lines], False
-
-    code = snapshot.get("code")
-    body = snapshot.get("body") or {}
-    plan = (body.get("plan_type") or "").title() if code == 200 else ""
-    expiry, expired = token_expiry_notice(tok.get("expires_at_ms"))
-    if code == 429:
-        status = rate_limit_notice(
-            displayed_cache_age(snapshot, include_live_429=True))
-    else:
-        status = cache_notice(code, displayed_cache_age(snapshot))
-    lines.extend(section_header(
-        "OPENAI",
-        f"ChatGPT {plan} Plan" if plan else "ChatGPT",
-        width,
-        [status, expiry],
-    ))
-    service_line = provider_status_line(snapshot.get("service_status"))
-    if service_line:
-        lines.append(service_line)
-
-    if code == 401:
-        lines.append(warn_line("token rejected (401)"
-                               + (" — expired" if expired else "")
-                               + "; run `codex` to refresh"))
-        return [clip_ansi(line, width) for line in lines], False
-    if code == 429:
-        return [clip_ansi(line, width) for line in lines], False
-    if code != 200:
-        lines.append(warn_line(f"API error {code}: {json.dumps(body)[:200]}"))
-        return [clip_ansi(line, width) for line in lines], False
-
-    credit_line = openai_credit_status_line(body)
-    if credit_line:
-        lines.append(credit_line)
-
-    rl = body.get("rate_limit") or {}
-    if rl.get("limit_reached"):
-        lines.append(f"  {fg256(203)}● limit reached — requests will be rejected"
-                     f"{RESET}")
-    elif not rl.get("allowed", True):
-        lines.append(f"  {fg256(214)}⚠ requests not currently allowed{RESET}")
-
-    # Weekly (secondary) window first — it's the limit that matters most.
-    base_rows = openai_window_rows(snapshot, rl)
-    # Named allowances (Codex Spark, Luna Reserve) only earn a row once
-    # something has actually drawn on them.
-    additional_groups = [
-        (title, rate_limit, openai_window_rows(snapshot, rate_limit))
-        for title, rate_limit, _feature in openai_additional_rate_limits(body)
-        if openai_limit_in_use(rate_limit)
-    ]
-    window_rows = base_rows + [
-        window_row
-        for _title, _rate_limit, group_rows in additional_groups
-        for window_row in group_rows
-    ]
-
-    label_w, pct_w = row_layout_widths(
-        [label for label, _usage, _now_pct, _reset_dt, _rem_s in window_rows],
-        [usage for _label, usage, _now_pct, _reset_dt, _rem_s in window_rows],
-        width,
-    )
-    printed = 0
-    for label, usage, now_pct, reset_dt, rem_s in base_rows:
-        lines.extend(row(label, usage, now_pct, reset_dt, rem_s, width,
-                         label_w, pct_w).splitlines())
-        printed += 1
-    for title, rate_limit, group_rows in additional_groups:
-        if not group_rows:
-            continue
-        lines.append(openai_limit_heading(title, rate_limit))
-        for label, usage, now_pct, reset_dt, rem_s in group_rows:
-            lines.extend(row(label, usage, now_pct, reset_dt, rem_s, width,
-                             label_w, pct_w).splitlines())
-            printed += 1
-    if not printed:
-        lines.append(f"  {DIM}(no usage data){RESET}")
-    return [clip_ansi(line, width) for line in lines], True
+    return render_provider_section(provider_view("openai", snapshot), width)
 
 
 # ------------------------------------------------------------ json output ----
@@ -2024,26 +1863,14 @@ def render_openai_section(snapshot: dict, width: int
 # as a percent (0-100) plus seconds-until-reset. Each provider also includes
 # its provider-specific additional limits and read-only credit/spend status.
 
-def _anthropic_json(service_status_snapshot: dict | None = None) -> dict:
-    if service_status_snapshot is None:
-        service_status_snapshot = provider_status_snapshot("anthropic")
-    service_status = provider_status_json(service_status_snapshot)
-    tok = load_anthropic_token()
-    if not tok or not tok.get("access_token"):
-        return {"ok": False, "error": "no OAuth token", "windows": {},
-                "cached": False, "cache_age_seconds": None,
-                "service_status": service_status}
-    code, a, age = cached_fetch("anthropic", fetch_anthropic, tok)
-    if code != 200:
-        err = "rate limited (429)" if code == 429 else f"API error {code}"
-        return {"ok": False, "error": err, "windows": {},
-                "rate_limited": code == 429,
-                "oauth_expires_at_ms": tok.get("expires_at_ms"),
-                "cached": age is not None, "cache_age_seconds": age,
-                "service_status": service_status}
+
+
+
+def _anthropic_view_data(snapshot: dict, display: dict) -> dict:
+    tok, body = snapshot["token"], snapshot["body"]
     now = datetime.now(timezone.utc)
     windows: dict[str, Any] = {}
-    for band in anthropic_limit_bands(a):
+    for band in anthropic_limit_bands(body):
         reset_dt = parse_iso(band.get("resets_at"))
         rem = (reset_dt - now).total_seconds() if reset_dt else None
         windows[band["key"]] = {
@@ -2058,89 +1885,78 @@ def _anthropic_json(service_status_snapshot: dict | None = None) -> dict:
             "severity": band.get("severity"),
             "source": band.get("source"),
         }
+        display["rows"].append(usage_row(
+            band["label"], band["utilization"], band["window_seconds"], rem))
+    display["extras"] = anthropic_extras_parts(body)
     return {"ok": True, "error": None,
             "subscription": tok.get("subscription"), "windows": windows,
-            "usage_credits": normalize_anthropic_spend(a),
-            "rate_limit_reset_credits": anthropic_reset_grants(a),
-            "oauth_expires_at_ms": tok.get("expires_at_ms"),
-            "cached": age is not None, "cache_age_seconds": age,
-            "service_status": service_status}
+            "usage_credits": normalize_anthropic_spend(body),
+            "rate_limit_reset_credits": anthropic_reset_grants(body),
+            "oauth_expires_at_ms": tok.get("expires_at_ms")}
 
 
-def _openai_json(service_status_snapshot: dict | None = None) -> dict:
-    if service_status_snapshot is None:
-        service_status_snapshot = provider_status_snapshot("openai")
-    service_status = provider_status_json(service_status_snapshot)
-    loaded_at = time.time()
-    tok = load_codex_token()
-    if not tok or not tok.get("access_token"):
-        return {"ok": False, "error": "no OAuth token", "windows": {},
-                "cached": False, "cache_age_seconds": None,
-                "service_status": service_status}
-    code, o, age = cached_fetch("openai", fetch_codex, tok)
-    if code != 200:
-        err = "rate limited (429)" if code == 429 else f"API error {code}"
-        return {"ok": False, "error": err, "windows": {},
-                "rate_limited": code == 429,
-                "oauth_expires_at_ms": tok.get("expires_at_ms"),
-                "cached": age is not None, "cache_age_seconds": age,
-                "service_status": service_status}
-    rl = o.get("rate_limit") or {}
-    snapshot = {"loaded_at": loaded_at, "age": age}
-    windows: dict[str, Any] = {}
-    for key in ("secondary_window", "primary_window"):
-        w = rl.get(key)
-        if not w:
-            continue
-        windows[key] = {
-            "utilization": float(w.get("used_percent", 0)),
-            "reset_seconds": adjusted_openai_reset_seconds(snapshot, w),
-            "reset_at": w.get("reset_at"),
-            "window_seconds": w.get("limit_window_seconds"),
+def _openai_windows_json(bands: list[dict]) -> dict[str, Any]:
+    return {
+        band["key"]: {
+            "label": band["label"],
+            "utilization": band["utilization"],
+            "reset_seconds": band["reset_seconds"],
+            "reset_at": band["reset_at"],
+            "window_seconds": band["window_seconds"],
         }
+        for band in bands
+    }
+
+
+def _band_rows(bands: list[dict]) -> list[dict]:
+    return [usage_row(b["label"], b["utilization"], b["window_seconds"],
+                      b["reset_seconds"]) for b in bands]
+
+
+def _openai_view_data(snapshot: dict, display: dict) -> dict:
+    tok, body = snapshot["token"], snapshot["body"]
+    rl = body.get("rate_limit") or {}
+    bands = openai_bands(snapshot, rl)
+    display["rows"].extend(_band_rows(bands))
     additional = []
-    raw_groups = [item for item in o.get("additional_rate_limits") or []
-                  if isinstance(item, dict)
-                  and isinstance(item.get("rate_limit"), dict)]
-    for raw, (title, rate_limit, feature) in zip(
-            raw_groups, openai_additional_rate_limits(o)):
-        extra_windows: dict[str, Any] = {}
-        for key in ("secondary_window", "primary_window"):
-            w = rate_limit.get(key)
-            if not w:
-                continue
-            extra_windows[key] = {
-                "utilization": float(w.get("used_percent", 0)),
-                "reset_seconds": adjusted_openai_reset_seconds(snapshot, w),
-                "reset_at": w.get("reset_at"),
-                "window_seconds": w.get("limit_window_seconds"),
-            }
+    for group in openai_additional_rate_limits(body):
+        rate_limit = group["rate_limit"]
+        group_bands = openai_bands(snapshot, rate_limit)
+        in_use = openai_limit_in_use(rate_limit)
         additional.append({
-            "name": raw.get("limit_name") or feature or "Additional limit",
-            "display_name": title,
-            "metered_feature": feature,
-            "normal_model_slug": raw.get("normal_model_slug"),
-            "in_use": openai_limit_in_use(rate_limit),
+            "name": group["name"],
+            "display_name": group["display_name"],
+            "metered_feature": group["metered_feature"],
+            "normal_model_slug": group["normal_model_slug"],
+            "in_use": in_use,
             "allowed": bool(rate_limit.get("allowed", True)),
             "limit_reached": bool(rate_limit.get("limit_reached")),
-            "windows": extra_windows,
+            "windows": _openai_windows_json(group_bands),
         })
-    credits = o.get("credits") or {}
-    next_credit_expiry = openai_next_reset_credit_expiry(o)
-    reset_credit_json: dict[str, Any] = {
-        "available_count": openai_reset_credit_count(o),
-        "details_complete": openai_reset_credit_details_complete(o),
-        "next_expires_at": next_credit_expiry,
-        "next_expires_in_seconds": (
-            max(0.0, next_credit_expiry - time.time())
-            if next_credit_expiry is not None else None
-        ),
-    }
+        # Named allowances (Codex Spark, Luna Reserve) only earn rows once
+        # something has actually drawn on them.
+        if in_use and group_bands:
+            display["rows"].append({
+                "type": "heading",
+                "text": group["display_name"],
+                "badges": openai_limit_badges(rate_limit),
+            })
+            display["rows"].extend(_band_rows(group_bands))
+    if rl.get("limit_reached"):
+        display["alerts"].append(
+            seg("● limit reached — requests will be rejected", "critical"))
+    elif not rl.get("allowed", True):
+        display["alerts"].append(
+            seg("⚠ requests not currently allowed", "warn"))
+    display["extras"] = openai_extras_parts(body)
+
+    credits = body.get("credits") or {}
+    next_credit_expiry = openai_next_reset_credit_expiry(body)
     return {"ok": True, "error": None,
-            "plan": o.get("plan_type"),
+            "plan": body.get("plan_type"),
             "oauth_expires_at_ms": tok.get("expires_at_ms"),
             "limit_reached": bool(rl.get("limit_reached")),
-            "windows": windows,
+            "windows": _openai_windows_json(bands),
             "additional_rate_limits": additional,
             "credits": {
                 "has_credits": bool(credits.get("has_credits")),
@@ -2149,16 +1965,157 @@ def _openai_json(service_status_snapshot: dict | None = None) -> dict:
                 "overage_limit_reached": bool(
                     credits.get("overage_limit_reached")),
             },
-            "rate_limit_reset_credits": reset_credit_json,
-            "cached": age is not None, "cache_age_seconds": age,
-            "service_status": service_status}
+            "rate_limit_reset_credits": {
+                "available_count": openai_reset_credit_count(body),
+                "details_complete": openai_reset_credit_details_complete(body),
+                "next_expires_at": next_credit_expiry,
+                "next_expires_in_seconds": (
+                    max(0.0, next_credit_expiry - time.time())
+                    if next_credit_expiry is not None else None
+                ),
+            }}
+
+
+PROVIDERS = {
+    "anthropic": {
+        "title": "ANTHROPIC",
+        "brand": "Claude",
+        "cli": "claude",
+        "token_env": "CLAUDE_CODE_OAUTH_TOKEN",
+        "plan": lambda snapshot: (snapshot.get("token") or {}).get(
+            "subscription"),
+        "data": _anthropic_view_data,
+    },
+    "openai": {
+        "title": "OPENAI",
+        "brand": "ChatGPT",
+        "cli": "codex",
+        "token_env": "CODEX_OAUTH_TOKEN",
+        "plan": lambda snapshot: (
+            (snapshot.get("body") or {}).get("plan_type")
+            if snapshot.get("code") == 200 else None),
+        "data": _openai_view_data,
+    },
+}
+
+
+def provider_view(provider: str, snapshot: dict) -> dict:
+    """Build the provider view every surface renders from.
+
+    The result is the provider's `--json` object: normalized data for
+    consumers plus a `display` block holding every presentation decision
+    (title, plan, header notices, service line, error, alerts, extras, and
+    rows with severity and pace). The terminal and the HTML page only map
+    tones to colors and lay the display block out. Build it at render time:
+    notice clocks and countdowns are computed against the current time.
+    """
+    meta = PROVIDERS[provider]
+    service_status = provider_status_json(snapshot.get("service_status"))
+    plan = (meta["plan"](snapshot) or "").title()
+    display: dict[str, Any] = {
+        "title": meta["title"],
+        "plan": f"{meta['brand']} {plan} Plan" if plan else meta["brand"],
+        "notices": [],
+        "service": service_status_segment(snapshot.get("service_status")),
+        "error": None,
+        "alerts": [],
+        "extras": [],
+        "rows": [],
+    }
+    tok = snapshot.get("token")
+    if not tok or not tok.get("access_token"):
+        display["plan"] = meta["brand"]
+        display["error"] = (f"no OAuth token (set ${meta['token_env']} or "
+                            f"run `{meta['cli']}` to login)")
+        return {"ok": False, "error": "no OAuth token", "windows": {},
+                "cached": False, "cache_age_seconds": None,
+                "service_status": service_status, "display": display}
+
+    code, age = snapshot.get("code"), snapshot.get("age")
+    expiry, expired = token_expiry_notice(tok.get("expires_at_ms"))
+    if code == 429:
+        status = rate_limit_notice(
+            displayed_cache_age(snapshot, include_live_429=True))
+    else:
+        status = cache_notice(code, displayed_cache_age(snapshot))
+    display["notices"] = [n for n in (status, expiry) if n]
+
+    if code == 200:
+        view = meta["data"](snapshot, display)
+    else:
+        if code == 401:
+            display["error"] = ("token rejected (401)"
+                                + (" — expired" if expired else "")
+                                + f"; run `{meta['cli']}` to refresh")
+        elif code != 429:
+            body = snapshot.get("body") or {}
+            display["error"] = f"API error {code}: {json.dumps(body)[:200]}"
+        view = {"ok": False,
+                "error": ("rate limited (429)" if code == 429
+                          else f"API error {code}"),
+                "windows": {},
+                "rate_limited": code == 429,
+                "oauth_expires_at_ms": tok.get("expires_at_ms")}
+    view.update({"cached": age is not None, "cache_age_seconds": age,
+                 "service_status": service_status, "display": display})
+    return view
+
+
+def render_provider_section(view: dict, width: int
+                            ) -> tuple[list[str], bool]:
+    """Lay a provider view out as terminal lines. Returns lines plus ok."""
+    d = view["display"]
+    lines = section_header(
+        d["title"], d["plan"], width,
+        [seg_ansi(notice, "[", "]") for notice in d["notices"]])
+    if d["service"]:
+        lines.append("  " + seg_ansi(d["service"]))
+    if d["error"]:
+        lines.append(warn_line(d["error"]))
+    if not view["ok"]:
+        return [clip_ansi(line, width) for line in lines], False
+
+    extras = extras_line(d["extras"])
+    if extras:
+        lines.append(extras)
+    lines.extend("  " + seg_ansi(alert) for alert in d["alerts"])
+    rows = [item for item in d["rows"] if item["type"] == "row"]
+    label_w, pct_w = row_layout_widths(rows, width)
+    for item in d["rows"]:
+        if item["type"] == "heading":
+            lines.append(f"  {DIM}{item['text']}{RESET}" + "".join(
+                "  " + seg_ansi(badge) for badge in item["badges"]))
+        else:
+            lines.extend(row(item, width, label_w, pct_w).splitlines())
+    if not rows:
+        lines.append(f"  {DIM}(no usage data){RESET}")
+    return [clip_ansi(line, width) for line in lines], True
+
+
+def _provider_json(provider: str, snapshot_fn,
+                   service_status_snapshot: dict | None) -> dict:
+    snapshot = snapshot_fn()
+    snapshot["service_status"] = (
+        service_status_snapshot if service_status_snapshot is not None
+        else provider_status_snapshot(provider))
+    return provider_view(provider, snapshot)
+
+
+def _anthropic_json(service_status_snapshot: dict | None = None) -> dict:
+    return _provider_json("anthropic", anthropic_snapshot,
+                          service_status_snapshot)
+
+
+def _openai_json(service_status_snapshot: dict | None = None) -> dict:
+    return _provider_json("openai", openai_snapshot, service_status_snapshot)
 
 
 def emit_json() -> int:
-    a = _anthropic_json()
-    o = _openai_json()
+    snapshot = load_dashboard_snapshot()
+    a = provider_view("anthropic", snapshot["anthropic"])
+    o = provider_view("openai", snapshot["openai"])
     print(json.dumps({"anthropic": a, "openai": o}, indent=2))
-    return 0 if (a["ok"] and o["ok"]) else (1 if (a["ok"] or o["ok"]) else 2)
+    return dashboard_exit_code(a["ok"], o["ok"])
 
 
 # ------------------------------------------------------------ html output ----
@@ -2240,19 +2197,20 @@ main{display:grid;gap:18px;
 .p-name{font-size:12px;font-weight:700;letter-spacing:.16em}
 .p-plan{color:var(--ink2);font-size:12px;margin-left:8px}
 .head-notes{display:flex;gap:4px 12px;flex-wrap:wrap;font-size:11.5px}
-.n-dim{color:var(--muted)} .n-warn{color:var(--serious)}
-.n-crit{color:var(--critical)}
-.svc{font-size:12px;color:var(--ink2);padding:7px 0 3px;
+.t-good{color:var(--under)} .t-caution{color:var(--warning)}
+.t-warn{color:var(--serious)} .t-critical{color:var(--critical)}
+.t-dim{color:var(--muted)} .t-white{color:var(--ink)}
+.svc{font-size:12px;padding:7px 0 3px;
   display:flex;gap:7px;align-items:baseline}
-.svc a{color:inherit;text-decoration:none;opacity:.75}
+.svc a{color:var(--ink2);text-decoration:none;opacity:.75}
 .svc a:hover{opacity:1;text-decoration:underline}
-.dot{width:8px;height:8px;border-radius:50%;flex:none;
-  display:inline-block;transform:translateY(.5px)}
 .err{color:var(--critical);font-size:13px;padding:10px 0 6px}
+.alert{font-size:13px;padding:10px 0 6px}
 .empty{color:var(--muted);font-size:13px;padding:10px 0 6px}
 .group{margin:12px 0 -4px;font-size:12px;color:var(--muted);
   display:flex;gap:4px 12px;flex-wrap:wrap;align-items:baseline}
-.badge{color:var(--critical);font-size:11.5px}
+.group .t-good,.group .t-caution,.group .t-warn,.group .t-critical{
+  font-size:11.5px}
 .rowline{padding:11px 0 7px}
 .row-head{display:flex;justify-content:space-between;align-items:baseline;
   gap:2px 12px;flex-wrap:wrap;font-size:12.5px;margin-bottom:7px}
@@ -2281,7 +2239,6 @@ main{display:grid;gap:18px;
 .extras{margin-top:12px;padding-top:10px;border-top:1px solid var(--hairline);
   font-size:12px;color:var(--ink2);display:flex;flex-wrap:wrap;gap:2px 7px}
 .x-label{color:var(--muted)}
-.x-on{color:var(--under)}
 footer{margin-top:28px;color:var(--muted);font-size:12px;
   display:flex;flex-direction:column;gap:9px}
 .legend{display:flex;gap:6px 16px;flex-wrap:wrap}
@@ -2324,7 +2281,6 @@ let receivedAt = Date.now();
 let offline = false;
 
 function elapsed() { return (Date.now() - receivedAt) / 1000; }
-function clamp(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
 
 function fmtRel(s) {
   s = Math.max(0, Math.floor(s));
@@ -2338,13 +2294,6 @@ function fmtRel(s) {
 
 function fmtAgo(s) { return s < 60 ? Math.floor(s) + "s" : fmtRel(s); }
 
-function windowLabel(ws, fallback) {
-  if (!ws || typeof ws !== "number") return fallback;
-  if (ws % 86400 === 0 && ws >= 86400) return (ws / 86400) + "-day";
-  if (ws % 3600 === 0) return (ws / 3600) + "-hour";
-  return ws + "s";
-}
-
 function h(tag, cls, ...kids) {
   const e = document.createElement(tag);
   if (cls) e.className = cls;
@@ -2355,25 +2304,18 @@ function h(tag, cls, ...kids) {
   return e;
 }
 
-function sevClass(pct) {
-  if (pct < 50) return "g";
-  if (pct < 75) return "w";
-  if (pct < 90) return "s";
-  return "c";
+// Every display decision arrives precomputed in each provider's `display`
+// block (see provider_view); this page only maps tones to classes, lays the
+// block out, and keeps embedded clocks ticking between polls.
+function segText(s) {
+  if (typeof s.seconds !== "number") return s.text;
+  const t = s.counting === "up" ? s.seconds + elapsed() : s.seconds - elapsed();
+  return s.text + fmtRel(t) + s.after;
 }
 
-function titleCase(s) {
-  return String(s).replace(/\\b[a-z]/g, ch => ch.toUpperCase());
-}
+function segEl(s) { return h("span", "t-" + s.tone, segText(s)); }
 
-function money(m) {
-  if (!m || typeof m.amount !== "number") return null;
-  const sym = ({USD: "$", EUR: "\\u20ac", GBP: "\\u00a3"})[m.currency];
-  const digits = Math.min(typeof m.exponent === "number" ? m.exponent : 2, 4);
-  const n = m.amount.toLocaleString(undefined,
-    {minimumFractionDigits: digits, maximumFractionDigits: digits});
-  return sym ? sym + n : (n + " " + (m.currency || "")).trim();
-}
+function partEl(part) { return h("span", null, ...part.map(segEl)); }
 
 function metaSegs(...segs) {
   const out = [];
@@ -2385,43 +2327,45 @@ function metaSegs(...segs) {
   return out;
 }
 
+const FILL = {good: "g", caution: "w", warn: "s", critical: "c"};
+const PACE = {over: ["pace-over", "\\u2191", " over pace"],
+              under: ["pace-under", "\\u2193", " under pace"],
+              on: ["pace-on", null, null]};
+
 function rowEl(it) {
-  const util = Math.max(0, Number(it.util) || 0);
-  const rem = it.rs !== null && it.rs !== undefined
-    ? Math.max(0, it.rs - elapsed()) : null;
-  const nowPct = it.ws && rem !== null
-    ? clamp((it.ws - rem) / it.ws * 100, 0, 100) : null;
+  const util = Math.max(0, Number(it.utilization) || 0);
+  const rem = typeof it.reset_seconds === "number"
+    ? Math.max(0, it.reset_seconds - elapsed()) : null;
+  const nowPct = typeof it.now_pct === "number" ? it.now_pct : null;
   const fillPct = Math.min(util, 100);
 
   const clip = h("div", "track-clip");
-  const fill = h("div", "fill " + sevClass(util));
+  const fill = h("div", "fill " + (FILL[it.severity] || "g"));
   fill.style.width = fillPct + "%";
   clip.appendChild(fill);
 
   let paceCls = "pace-on";
   let paceSeg = null;
   let nowSeg = null;
-  if (nowPct !== null) {
+  if (nowPct !== null && PACE[it.pace]) {
+    const [cls, arrow, verdict] = PACE[it.pace];
+    paceCls = cls;
     const margin = util - nowPct;
-    if (util >= nowPct + 5) paceCls = "pace-over";
-    else if (util <= nowPct - 5) paceCls = "pace-under";
     const signed = (margin >= 0 ? "+" : "\\u2212") +
       Math.abs(margin).toFixed(0) + "pp";
-    if (paceCls === "pace-over") {
-      paceSeg = h("span", paceCls, "\\u2191 " + signed + " over pace");
+    paceSeg = h("span", cls,
+      arrow ? arrow + " " + signed + verdict : "\\u2248 on pace");
+    if (it.pace === "over") {
       const left = Math.min(nowPct, fillPct);
       const band = h("div", "band deficit");
       band.style.left = left + "%";
       band.style.width = (fillPct - left) + "%";
       clip.appendChild(band);
-    } else if (paceCls === "pace-under") {
-      paceSeg = h("span", paceCls, "\\u2193 " + signed + " under pace");
+    } else if (it.pace === "under") {
       const band = h("div", "band lead");
       band.style.left = fillPct + "%";
       band.style.width = (nowPct - fillPct) + "%";
       clip.appendChild(band);
-    } else {
-      paceSeg = h("span", paceCls, "\\u2248 on pace");
     }
     nowSeg = h("span", null, "now " + nowPct.toFixed(0) + "%");
   }
@@ -2444,219 +2388,50 @@ function rowEl(it) {
     h("div", "row-body", utilEl, track));
 }
 
-function notices(p) {
-  const out = [];
-  if (p.rate_limited) {
-    out.push(h("span", "n-warn", "\\u25cf rate limited (429)"));
-  } else if (p.cached && p.cache_age_seconds !== null
-             && p.cache_age_seconds !== undefined) {
-    out.push(h("span", "n-dim",
-      "\\u21bb cached " + fmtRel(p.cache_age_seconds + elapsed()) + " ago"));
-  }
-  const exp = p.oauth_expires_at_ms;
-  if (exp !== null && exp !== undefined) {
-    const s = exp / 1000 - Date.now() / 1000;
-    if (s <= 0) {
-      out.push(h("span", "n-crit",
-        "\\u2716 OAuth expired " + fmtRel(-s) + " ago"));
-    } else if (s <= 4 * 3600) {
-      out.push(h("span", s < 3600 ? "n-crit" : "n-warn",
-        "\\u26a0 OAuth expires in " + fmtRel(s)));
-    }
-  }
-  return out;
-}
-
-function serviceLine(ss) {
-  if (!ss) return null;
-  const dot = color => {
-    const d = h("span", "dot");
-    d.style.background = color;
-    return d;
-  };
-  const link = () => {
-    if (!ss.page_url) return null;
-    const a = h("a", null, "\u2197");
-    a.href = ss.page_url;
+function serviceEl(s) {
+  if (!s) return null;
+  const line = h("div", "svc", segEl(s));
+  if (s.link) {
+    const a = h("a", null, "\\u2197");
+    a.href = s.link;
     a.target = "_blank";
     a.rel = "noopener";
     a.title = "Open status page";
     a.setAttribute("aria-label", "Open status page");
-    return a;
-  };
-  if (!ss.available) {
-    if (!ss.error) return null;
-    return h("div", "svc", dot("var(--serious)"),
-      h("span", null, "service status unavailable (" + ss.error + ")"),
-      link());
+    line.appendChild(a);
   }
-  if (ss.operational && !ss.stale) return null;
-  const confirmed = ss.stale
-    ? " \\u00b7 last confirmed " + (
-        typeof ss.cache_age_seconds === "number"
-          ? fmtRel(ss.cache_age_seconds + elapsed()) + " ago" : "earlier")
-    : "";
-  if (ss.operational) {
-    return h("div", "svc", dot("var(--serious)"),
-      h("span", null, "status unavailable; last known: "
-        + ss.description + confirmed), link());
-  }
-  const color = ss.indicator === "major" || ss.indicator === "critical"
-    ? "var(--critical)"
-    : ss.indicator === "minor" ? "var(--serious)" : "var(--warning)";
-  return h("div", "svc", dot(color),
-    h("span", null, (ss.description || "Service disruption") + confirmed),
-    link());
+  return line;
 }
 
-function extrasEl(parts) {
-  if (!parts.length) return null;
-  return h("div", "extras", h("span", "x-label", "extras"),
-    ...metaSegs(...parts));
-}
-
-function anthRows(p) {
-  return Object.entries(p.windows || {}).map(([key, w]) => ({
-    label: w.label || key,
-    util: w.utilization,
-    rs: w.reset_seconds,
-    ws: w.window_seconds,
-  }));
-}
-
-function resetParts(rc) {
-  const count = (rc && rc.available_count) || 0;
-  if (count <= 0) return [];
-  const parts = [h("span", "x-on",
-    count + " usage " + (count === 1 ? "reset" : "resets"))];
-  if (typeof rc.next_expires_in_seconds === "number") {
-    const rem = Math.max(0, rc.next_expires_in_seconds - elapsed());
-    const cls = rem <= 4 * 3600 ? "n-crit"
-      : rem <= 24 * 3600 ? "n-warn" : null;
-    const when = rem <= 3 * 86400
-      ? "in " + fmtRel(rem)
-      : new Date((rc.next_expires_at || 0) * 1000).toLocaleString(
-          undefined, {weekday: "short", month: "short", day: "numeric",
-                      hour: "2-digit", minute: "2-digit"});
-    parts.push(h("span", cls, "next expires " + when));
-  }
-  return parts;
-}
-
-function anthResetParts(p) {
-  const rc = p.rate_limit_reset_credits;
-  const parts = resetParts(rc);
-  if (!parts.length || rc.usable_now) return parts;
-  const cooldown = rc.cooldown_until ? Date.parse(rc.cooldown_until) : NaN;
-  const text = !isNaN(cooldown) && cooldown > Date.now()
-    ? "cooling down until " + new Date(cooldown).toLocaleString(
-        undefined, {weekday: "short", month: "short", day: "numeric",
-                    hour: "2-digit", minute: "2-digit"})
-    : rc.use_requires_limit ? "usable once limited" : "not usable now";
-  parts.push(h("span", "n-warn", text));
-  return parts;
-}
-
-function anthExtras(p) {
-  return extrasEl(anthSpendParts(p).concat(anthResetParts(p)));
-}
-
-function anthSpendParts(p) {
-  const uc = p.usage_credits;
-  if (!uc) return [];
-  const used = uc.used && typeof uc.used.amount === "number"
-    ? uc.used.amount : 0;
-  const actionable = uc.severity && uc.severity !== "normal";
-  if (!(uc.enabled || used > 0 || actionable)) return [];
-  const parts = [h("span", uc.enabled ? "x-on" : null,
-    "usage credits " + (uc.enabled ? "on" : "off"))];
-  const u = money(uc.used), l = money(uc.limit);
-  if (u && l) parts.push(h("span", null, u + " / " + l));
-  const reason = uc.disabled_reason;
-  if (reason && reason !== "disabled" && reason !== "not_enabled") {
-    parts.push(h("span", "n-warn", String(reason).replace(/_/g, " ")));
-  }
-  if (actionable) {
-    parts.push(h("span", "n-warn", String(uc.severity).replace(/_/g, " ")));
-  }
-  return parts;
-}
-
-function winRow(key, w) {
-  return {
-    label: windowLabel(w.window_seconds,
-      key === "primary_window" ? "session" : "weekly"),
-    util: w.utilization,
-    rs: w.reset_seconds,
-    ws: w.window_seconds,
-  };
-}
-
-function oaRows(p) {
-  const out = Object.entries(p.windows || {})
-    .map(([key, w]) => winRow(key, w));
-  for (const group of p.additional_rate_limits || []) {
-    if (!group.in_use) continue;
-    const rows = Object.entries(group.windows || {})
-      .map(([key, w]) => winRow(key, w));
-    if (!rows.length) continue;
-    const badges = [];
-    if (group.limit_reached) {
-      badges.push(h("span", "badge", "\\u25cf limit reached"));
-    } else if (group.allowed === false) {
-      badges.push(h("span", "badge", "\\u26a0 not currently allowed"));
-    }
-    out.push({group: true, name: group.display_name || group.name,
-              badges: badges});
-    out.push(...rows);
-  }
-  return out;
-}
-
-function oaExtras(p) {
-  const parts = [];
-  const credits = p.credits || {};
-  if (credits.unlimited) {
-    parts.push(h("span", "x-on", "credits unlimited"));
-  } else if (credits.overage_limit_reached) {
-    parts.push(h("span", "n-crit", "credit limit reached"));
-  } else if (credits.has_credits) {
-    const balance = credits.balance;
-    parts.push(h("span", "x-on",
-      balance !== null && balance !== undefined && balance !== ""
-        ? "credit balance " + balance : "credits available"));
-  }
-  parts.push(...resetParts(p.rate_limit_reset_credits));
-  return extrasEl(parts);
-}
-
-function card(name, plan, p, rows, extras) {
-  const nameEl = h("div", null, h("span", "p-name", name));
-  if (plan) nameEl.appendChild(h("span", "p-plan", plan));
+function card(name, p) {
+  // A payload without a view (collection failed) still renders its error.
+  const d = p.display || {title: name, plan: "", notices: [], service: null,
+    error: p.error || "unavailable", alerts: [], extras: [], rows: []};
+  const nameEl = h("div", null, h("span", "p-name", d.title));
+  if (d.plan) nameEl.appendChild(h("span", "p-plan", d.plan));
   const c = h("section", "card",
-    h("div", "card-head", nameEl, h("div", "head-notes", ...notices(p))));
-  const svc = serviceLine(p.service_status);
+    h("div", "card-head", nameEl,
+      h("div", "head-notes", ...d.notices.map(segEl))));
+  const svc = serviceEl(d.service);
   if (svc) c.appendChild(svc);
-  if (!p.ok) {
-    c.appendChild(h("div", "err", "\\u2716 " + (p.error || "unavailable")));
-    return c;
-  }
-  if (p.limit_reached) {
-    c.appendChild(h("div", "err",
-      "\\u25cf limit reached \\u2014 requests will be rejected"));
-  }
+  if (d.error) c.appendChild(h("div", "err", "\\u2716 " + d.error));
+  if (!p.ok) return c;
+  for (const a of d.alerts) c.appendChild(h("div", "alert", segEl(a)));
   let printed = 0;
-  for (const it of rows) {
-    if (it.group) {
+  for (const it of d.rows) {
+    if (it.type === "heading") {
       c.appendChild(h("div", "group",
-        h("span", null, it.name), ...it.badges));
+        h("span", null, it.text), ...it.badges.map(segEl)));
     } else {
       c.appendChild(rowEl(it));
       printed++;
     }
   }
   if (!printed) c.appendChild(h("div", "empty", "(no usage data)"));
-  if (extras) c.appendChild(extras);
+  if (d.extras.length) {
+    c.appendChild(h("div", "extras", h("span", "x-label", "extras"),
+      ...metaSegs(...d.extras.map(partEl))));
+  }
   return c;
 }
 
@@ -2676,16 +2451,11 @@ function chipEl() {
 }
 
 function render() {
-  const a = data.anthropic || {ok: false, error: "missing provider data"};
-  const o = data.openai || {ok: false, error: "missing provider data"};
-  const aPlan = a.subscription
-    ? "Claude " + titleCase(a.subscription) + " plan" : "Claude";
-  const oPlan = o.plan
-    ? "ChatGPT " + titleCase(o.plan) + " plan" : "ChatGPT";
+  const missing = {ok: false, error: "missing provider data"};
   const root = document.getElementById("providers");
   root.textContent = "";
-  root.appendChild(card("ANTHROPIC", aPlan, a, anthRows(a), anthExtras(a)));
-  root.appendChild(card("OPENAI", oPlan, o, oaRows(o), oaExtras(o)));
+  root.appendChild(card("ANTHROPIC", data.anthropic || missing));
+  root.appendChild(card("OPENAI", data.openai || missing));
   chipEl();
 }
 
@@ -2845,10 +2615,17 @@ def run_html_server(fresh: bool, port: int = DEFAULT_HTML_PORT) -> int:
 # ------------------------------------------------------------ dashboard ----
 
 def load_dashboard_snapshot() -> dict:
-    anthropic_status = provider_status_snapshot("anthropic")
-    openai_status = provider_status_snapshot("openai")
-    a = anthropic_snapshot()
-    o = openai_snapshot()
+    # The four loads are independent (separate hosts, separate cache files,
+    # fetchers never raise), so run them concurrently: a cold refresh costs
+    # the slowest request instead of the sum of all four.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [
+            pool.submit(provider_status_snapshot, "anthropic"),
+            pool.submit(provider_status_snapshot, "openai"),
+            pool.submit(anthropic_snapshot),
+            pool.submit(openai_snapshot),
+        ]
+        anthropic_status, openai_status, a, o = (f.result() for f in futures)
     a["service_status"] = anthropic_status
     o["service_status"] = openai_status
     deadline = min(
@@ -2893,10 +2670,12 @@ def render_dashboard_snapshot(snapshot: dict, columns: int,
                               clamp_width: bool) -> tuple[list[str], int]:
     width = display_width(columns, clamp_width)
     lines = []
-    a_lines, a_ok = render_anthropic_section(snapshot["anthropic"], width)
+    a_lines, a_ok = render_provider_section(
+        provider_view("anthropic", snapshot["anthropic"]), width)
     lines.extend(a_lines)
     lines.extend(["", RULE_FG + "═" * width + RESET, ""])
-    o_lines, o_ok = render_openai_section(snapshot["openai"], width)
+    o_lines, o_ok = render_provider_section(
+        provider_view("openai", snapshot["openai"]), width)
     lines.extend(o_lines)
     lines.append("")
     lines.extend(legend_lines())
