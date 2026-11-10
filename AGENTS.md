@@ -2,6 +2,10 @@
 
 This file provides guidance to coding agents when working with code in this repository.
 
+## Delivery authority
+
+For approved project work, agents make ordinary commits and non-force fast-forward pushes to the existing authorized upstream without a separate human approval, after applicable checks pass. Stage only attributable, scope-owned changes and preserve unrelated work. Inspect the staged diff and resulting commit, keep hooks enabled, and verify actual remote readback. Pending subjective or product review does not delay qualified delivery. Preserve explicit task-specific local-only or no-publication holds and unresolved custody conflicts. This grants no new remote, expanded publication scope, credential/access/security change, history rewrite, destructive operation or bypass of native permission denials.
+
 ## What this is
 
 A single-file, stdlib-only Python 3 runtime (`llm-usage`) that displays Anthropic (Claude) and OpenAI (ChatGPT/Codex) subscription rate-limit usage — the same numbers Claude Code's `/usage` and the Codex CLI report. Provider-specific usage credits, spending, reset counts, and scoped model/feature limits are included when present. There is no build system or runtime dependency; `tests/` contains sanitized modern and legacy JSON fixtures plus stdlib `unittest` coverage.
