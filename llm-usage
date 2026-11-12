@@ -1462,6 +1462,60 @@ def _aware_epoch(value: Any) -> float | None:
     return dt.timestamp()
 
 
+# Scope of the allowance a reset grant restores, in display order. The raw
+# `type` field is not used: observed 2026-11-11, the full reset says
+# "weekly" while the Fable-specific grants say "full".
+ANTHROPIC_RESET_SCOPES = ("full", "fable", "unknown")
+ANTHROPIC_RESET_SCOPE_NOUNS = {
+    "full": ("full reset", "full resets"),
+    "fable": ("Fable-specific reset", "Fable-specific resets"),
+    "unknown": ("reset of unknown scope", "resets of unknown scope"),
+}
+
+
+def anthropic_reset_scope(grant: dict) -> str:
+    """Classify a grant by the limits it clears plus its provider label.
+
+    `full` clears the all-model weekly limit (`seven_day`). `fable` clears
+    only `seven_day_overage_included` and carries a provider label naming
+    Fable (both observed 2026-11-11). Anything else (missing, empty or
+    unrecognized `clears`, or an unlabelled scoped grant) stays `unknown`
+    rather than being guessed.
+    """
+    clears = grant.get("clears")
+    if (not isinstance(clears, list) or not clears
+            or not all(isinstance(key, str) for key in clears)):
+        return "unknown"
+    if "seven_day" in clears:
+        return "full"
+    label = grant.get("label")
+    if (set(clears) == {"seven_day_overage_included"}
+            and isinstance(label, str) and "fable" in label.lower()):
+        return "fable"
+    return "unknown"
+
+
+def _reset_grant_summary(available: list[dict], next_id: Any,
+                         now: float) -> dict:
+    """Count, next grant, usability and expiry for some available grants."""
+    next_grant = next((grant for grant in available
+                       if grant["id"] == next_id), None)
+    if next_grant is None and available:
+        next_grant = min(available, key=lambda grant: grant["ends_at_epoch"])
+    next_expiry = (min(grant["ends_at_epoch"] for grant in available)
+                   if available else None)
+    return {
+        "available_count": sum(grant["resets_left"] for grant in available),
+        "next_grant_id": next_grant["id"] if next_grant else None,
+        "usable_now": bool(next_grant and next_grant["usable_now"]),
+        "use_requires_limit": bool(
+            next_grant and next_grant["use_requires_limit"]),
+        "next_expires_at": next_expiry,
+        "next_expires_in_seconds": (
+            max(0.0, next_expiry - now) if next_expiry is not None else None),
+    }
+
+
 def anthropic_reset_grants(body: dict, now: float | None = None
                            ) -> dict | None:
     """Normalize banked usage-limit reset grants (the `cedar_ember` block).
@@ -1469,7 +1523,10 @@ def anthropic_reset_grants(body: dict, now: float | None = None
     Returns None when the response carries no grant block (older cached
     bodies, or a request without `cedar_ember=1`). A grant counts toward
     `available_count` only while it has resets left, is not paused, has
-    started, and has a well-formed future `ends_at`.
+    started, and has a well-formed future `ends_at`. The top-level counts
+    aggregate every scope; `groups` breaks them out per scope (see
+    `anthropic_reset_scope`), each with its own next grant, usability and
+    expiry, for every scope that has any grant at all.
     """
     raw = body.get("cedar_ember")
     if not isinstance(raw, dict):
@@ -1500,48 +1557,62 @@ def anthropic_reset_grants(body: dict, now: float | None = None
             "paused": bool(grant.get("paused")),
             "usable_now": bool(grant.get("usable_now")),
             "use_requires_limit": bool(grant.get("use_requires_limit")),
+            "scope": anthropic_reset_scope(grant),
             "available": available,
         })
     available = [grant for grant in grants if grant["available"]]
     next_id = raw.get("next_grant_id")
-    next_grant = next((grant for grant in available
-                       if grant["id"] == next_id), None)
-    if next_grant is None and available:
-        next_grant = min(available, key=lambda grant: grant["ends_at_epoch"])
-    next_expiry = (min(grant["ends_at_epoch"] for grant in available)
-                   if available else None)
+    groups = []
+    for scope in ANTHROPIC_RESET_SCOPES:
+        if not any(grant["scope"] == scope for grant in grants):
+            continue
+        groups.append({"scope": scope, **_reset_grant_summary(
+            [grant for grant in available if grant["scope"] == scope],
+            next_id, now)})
+    summary = _reset_grant_summary(available, next_id, now)
     return {
         "eligible": bool(raw.get("eligible")),
         "ineligible_reason": raw.get("ineligible_reason"),
-        "available_count": sum(grant["resets_left"] for grant in available),
-        "next_grant_id": next_grant["id"] if next_grant else None,
-        "usable_now": bool(next_grant and next_grant["usable_now"]),
-        "use_requires_limit": bool(
-            next_grant and next_grant["use_requires_limit"]),
+        "available_count": summary["available_count"],
+        "next_grant_id": summary["next_grant_id"],
+        "usable_now": summary["usable_now"],
+        "use_requires_limit": summary["use_requires_limit"],
         "cooldown_until": raw.get("cooldown_until"),
-        "next_expires_at": next_expiry,
-        "next_expires_in_seconds": (
-            max(0.0, next_expiry - now) if next_expiry is not None else None),
+        "next_expires_at": summary["next_expires_at"],
+        "next_expires_in_seconds": summary["next_expires_in_seconds"],
+        "groups": groups,
         "grants": grants,
     }
 
 
 def anthropic_reset_parts(body: dict) -> list[list[dict]]:
-    """Extras parts for banked usage-limit resets."""
+    """Extras parts for banked usage-limit resets, one run per scope."""
     grants = anthropic_reset_grants(body)
     if not grants or not grants["available_count"]:
         return []
-    parts = [reset_credit_part(grants["available_count"],
-                               grants["next_expires_at"])]
-    if not grants["usable_now"]:
-        cooldown = _aware_epoch(grants.get("cooldown_until"))
-        if cooldown is not None and cooldown > time.time():
-            text = f"cooling down until {fmt_reset_credit_expiry(cooldown)}"
-        elif grants["use_requires_limit"]:
-            text = "usable once limited"
-        else:
-            text = "not usable now"
+    # The cooldown covers the whole block, so it is said once, at the end.
+    cooldown = _aware_epoch(grants.get("cooldown_until"))
+    cooling = cooldown is not None and cooldown > time.time()
+    parts = []
+    any_unusable = False
+    for group in grants["groups"]:
+        if not group["available_count"]:
+            continue
+        parts.append(reset_credit_part(
+            group["available_count"], group["next_expires_at"],
+            ANTHROPIC_RESET_SCOPE_NOUNS[group["scope"]]))
+        if group["usable_now"]:
+            continue
+        any_unusable = True
+        if cooling:
+            continue
+        text = ("usable once limited" if group["use_requires_limit"]
+                else "not usable now")
         parts.append([seg(text, "warn")])
+    if cooling and any_unusable:
+        parts.append([seg(
+            f"cooling down until {fmt_reset_credit_expiry(cooldown)}",
+            "warn")])
     return parts
 
 
@@ -1725,10 +1796,12 @@ def fmt_reset_credit_expiry(expires_at: float) -> str:
     return fmt_local(datetime.fromtimestamp(expires_at, tz=timezone.utc))
 
 
-def reset_credit_part(count: int, next_expiry: float | None) -> list[dict]:
+def reset_credit_part(count: int, next_expiry: float | None,
+                      nouns: tuple[str, str] = ("usage reset", "usage resets")
+                      ) -> list[dict]:
     """'N usage resets' plus an urgency-toned next-expiry clause."""
-    noun = "reset" if count == 1 else "resets"
-    part = [seg(f"{count} usage {noun}", "good")]
+    noun = nouns[0] if count == 1 else nouns[1]
+    part = [seg(f"{count} {noun}", "good")]
     if next_expiry is None:
         return part
     remaining = next_expiry - time.time()

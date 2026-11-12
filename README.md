@@ -51,7 +51,10 @@ appear inline on the provider title line.
 
 Each provider can add an `Extras:` line. Anthropic shows it only when usage
 credits are enabled, have recorded spending, or need attention; ordinary
-disabled states stay hidden. OpenAI reports purchased-credit status and
+disabled states stay hidden. Banked Anthropic usage-limit resets are broken out
+by what they restore — full resets versus Fable-specific resets, with any grant
+whose scope cannot be identified shown as being of unknown scope — each with
+its own next expiration. OpenAI reports purchased-credit status and
 available usage-limit resets. When the installed Codex app server supplies
 complete reset-credit details, the earliest expiration is shown in local time
 and urgency-colored; expirations within three days also include a relative
@@ -156,7 +159,10 @@ Every window carries `utilization` plus reset timing, and — where known — it
 carry a display `label`, and each provider object reports `oauth_expires_at_ms`
 for the credential it used. The Anthropic object also includes normalized
 `usage_credits` and limit metadata
-such as `kind`, `is_active`, and `severity`. The OpenAI object includes
+such as `kind`, `is_active`, and `severity`, plus
+`rate_limit_reset_credits`, whose aggregate `available_count` is broken
+out in `groups` by `scope` (`full`, `fable`, or `unknown`); each of its
+`grants` also carries its `scope`. The OpenAI object includes
 `additional_rate_limits`, `credits`, and `rate_limit_reset_credits`. Each
 additional limit carries its raw `name`, a friendly `display_name` (for
 example "Codex Spark" or "Luna Reserve"), and `in_use`, which is true once any

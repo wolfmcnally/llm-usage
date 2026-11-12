@@ -658,7 +658,7 @@ class AnthropicResetGrantTests(unittest.TestCase):
                                return_value=GRANT_NOW):
             line = llm_usage.anthropic_extras_line(body)
         plain = llm_usage.ANSI_RE.sub("", line)
-        self.assertIn("1 usage reset, next expires", plain)
+        self.assertIn("1 full reset, next expires", plain)
         self.assertNotIn("usage credits", plain)
         self.assertNotIn("usable", plain)
 
@@ -719,6 +719,237 @@ class AnthropicResetGrantTests(unittest.TestCase):
             deadline = llm_usage.next_data_refresh_deadline(
                 200, 0.0, GRANT_NOW, "openai", body)
         self.assertEqual(deadline, GRANT_NOW + llm_usage.DEFAULT_CACHE_TTL)
+
+
+# 2026-11-12T00:00:00Z, after the sanitized mixed grants below started.
+MIXED_NOW = 1794441600.0
+
+
+def mixed_reset_block(full_left=1, extra_grants=()):
+    """Sanitized full + Fable-specific grants in the shape seen 2026-11-11.
+
+    The raw `type` values are deliberately the observed, misleading ones:
+    the full reset says "weekly" and the Fable grants say "full".
+    """
+    def grant(grant_id, label, clears, kind, left, ends_at):
+        return {
+            "id": grant_id, "label": label, "resets_total": 1,
+            "resets_left": left,
+            "starts_at": "2026-11-09T18:00:00+00:00", "ends_at": ends_at,
+            "clears": clears, "paused": False, "usable_now": left > 0,
+            "use_requires_limit": False, "type": kind,
+            "gives_back_weekly": kind == "full",
+        }
+    fable_end = "2027-03-09T07:59:00+00:00"
+    grants = [
+        grant("full-reset", "One full limit reset (fixture month)",
+              ["seven_day", "seven_day_overage_included"], "weekly",
+              full_left, "2026-12-10T22:00:00+00:00"),
+        grant("fable-a", "Launch: one Fable reset",
+              ["seven_day_overage_included"], "full", 1, fable_end),
+        grant("fable-b", "Launch: one more Fable reset at 12 months",
+              ["seven_day_overage_included"], "full", 1, fable_end),
+        grant("fable-c", "Launch: one more Fable reset at 6 months",
+              ["seven_day_overage_included"], "full", 1, fable_end),
+    ] + list(extra_grants)
+    return {"eligible": True, "ineligible_reason": None, "grants": grants,
+            "next_grant_id": "fable-a" if not full_left else "full-reset",
+            "cooldown_until": None}
+
+
+def unknown_grant(**overrides):
+    grant = {"id": "mystery", "label": "Launch: one Sonnet reset",
+             "resets_total": 1, "resets_left": 1,
+             "starts_at": "2026-11-09T18:00:00+00:00",
+             "ends_at": "2026-11-20T00:00:00+00:00",
+             "clears": ["seven_day_sonnet"], "paused": False,
+             "usable_now": True, "use_requires_limit": False}
+    grant.update(overrides)
+    return grant
+
+
+class AnthropicResetScopeTests(unittest.TestCase):
+    def grants(self, block):
+        return llm_usage.anthropic_reset_grants(
+            {"cedar_ember": block}, now=MIXED_NOW)
+
+    def extras(self, block):
+        with mock.patch.object(llm_usage.time, "time",
+                               return_value=MIXED_NOW):
+            line = llm_usage.anthropic_extras_line({"cedar_ember": block})
+        return llm_usage.ANSI_RE.sub("", line) if line else None
+
+    def test_scope_uses_clears_and_label_not_raw_type(self):
+        scope = llm_usage.anthropic_reset_scope
+        self.assertEqual(scope({"clears": ["seven_day"], "type": "weekly"}),
+                         "full")
+        self.assertEqual(scope({"clears": ["seven_day_overage_included"],
+                                "label": "One Fable reset",
+                                "type": "full"}), "fable")
+        for grant in ({}, {"clears": None}, {"clears": []},
+                      {"clears": "seven_day"},
+                      {"clears": ["seven_day_overage_included"],
+                       "label": "Launch reset"},
+                      {"clears": ["seven_day_overage_included",
+                                  "seven_day_sonnet"],
+                       "label": "Fable reset"},
+                      {"clears": ["seven_day_sonnet"]}):
+            with self.subTest(grant=grant):
+                self.assertEqual(scope(grant), "unknown")
+
+    def test_verified_provider_labels_classify(self):
+        # Exact labels and clears observed 2026-11-11 (no account data).
+        cases = (
+            ("One full limit reset (November 2026)",
+             ["seven_day", "seven_day_overage_included"], "full"),
+            ("New model launch: one Fable reset for Max, Team Premium and "
+             "Enterprise Premium", ["seven_day_overage_included"], "fable"),
+            ("New model launch: one more Fable reset at 12 months' tenure",
+             ["seven_day_overage_included"], "fable"),
+            ("New model launch: one more Fable reset at 6 months' tenure",
+             ["seven_day_overage_included"], "fable"),
+        )
+        for label, clears, expected in cases:
+            with self.subTest(label=label):
+                self.assertEqual(llm_usage.anthropic_reset_scope(
+                    {"label": label, "clears": clears}), expected)
+
+    def test_malformed_clears_is_unknown_and_never_raises(self):
+        for clears in ([{"a": 1}], [["seven_day"]], [None], [1],
+                       ["seven_day_overage_included", {"x": 1}]):
+            with self.subTest(clears=clears):
+                self.assertEqual(llm_usage.anthropic_reset_scope(
+                    {"label": "Fable reset", "clears": clears}), "unknown")
+        block = mixed_reset_block(full_left=0, extra_grants=[
+            unknown_grant(clears=[{"a": 1}])])
+        grants = self.grants(block)
+        self.assertEqual(grants["available_count"], 4)
+        self.assertIn("1 reset of unknown scope", self.extras(block))
+
+    def test_paused_or_unstarted_grants_leave_their_group(self):
+        for name, overrides in (
+                ("paused", {"paused": True}),
+                ("not started", {"starts_at": "2026-11-13T00:00:00+00:00"})):
+            with self.subTest(name):
+                block = mixed_reset_block()
+                block["grants"][0].update(overrides)
+                grants = self.grants(block)
+                self.assertEqual(grants["available_count"], 3)
+                self.assertNotIn("full reset", self.extras(block))
+
+    def test_cooldown_is_reported_once(self):
+        block = mixed_reset_block()
+        block["cooldown_until"] = "2026-11-12T06:00:00+00:00"
+        for grant in block["grants"]:
+            grant["usable_now"] = False
+        plain = self.extras(block)
+        self.assertEqual(plain.count("cooling down until"), 1)
+        self.assertNotIn("not usable now", plain)
+
+    def test_cache_validity_follows_remaining_group_after_full_is_spent(self):
+        body = {"cedar_ember": mixed_reset_block(full_left=0)}
+        self.assertEqual(
+            llm_usage.usage_valid_until("anthropic", body, MIXED_NOW),
+            llm_usage._aware_epoch("2027-03-09T07:59:00+00:00"))
+
+    def test_mixed_grants_break_out_by_scope(self):
+        grants = self.grants(mixed_reset_block())
+        self.assertEqual(grants["available_count"], 4)
+        by_scope = {group["scope"]: group for group in grants["groups"]}
+        self.assertEqual([group["scope"] for group in grants["groups"]],
+                         ["full", "fable"])
+        self.assertEqual(by_scope["full"]["available_count"], 1)
+        self.assertEqual(by_scope["full"]["next_grant_id"], "full-reset")
+        self.assertEqual(by_scope["fable"]["available_count"], 3)
+        self.assertEqual(by_scope["fable"]["next_grant_id"], "fable-a")
+        self.assertEqual(by_scope["full"]["next_expires_at"],
+                         llm_usage._aware_epoch("2026-12-10T22:00:00+00:00"))
+        self.assertEqual(by_scope["fable"]["next_expires_at"],
+                         llm_usage._aware_epoch("2027-03-09T07:59:00+00:00"))
+        self.assertEqual(grants["next_expires_at"],
+                         by_scope["full"]["next_expires_at"])
+        self.assertEqual([grant["scope"] for grant in grants["grants"]],
+                         ["full", "fable", "fable", "fable"])
+        plain = self.extras(mixed_reset_block())
+        self.assertIn("1 full reset, next expires", plain)
+        self.assertIn("3 Fable-specific resets, next expires", plain)
+        self.assertLess(plain.index("full reset"),
+                        plain.index("Fable-specific"))
+
+    def test_spent_full_reset_shows_only_fable_resets(self):
+        block = mixed_reset_block(full_left=0)
+        grants = self.grants(block)
+        self.assertEqual(grants["available_count"], 3)
+        full = next(group for group in grants["groups"]
+                    if group["scope"] == "full")
+        self.assertEqual(full["available_count"], 0)
+        self.assertIsNone(full["next_expires_at"])
+        # The aggregate expiry now comes from the Fable grants only.
+        self.assertEqual(grants["next_expires_at"],
+                         llm_usage._aware_epoch("2027-03-09T07:59:00+00:00"))
+        plain = self.extras(block)
+        self.assertIn("3 Fable-specific resets", plain)
+        self.assertNotIn("full reset", plain)
+        self.assertNotIn("usage reset", plain)
+
+    def test_expired_group_drops_out_and_others_keep_their_expiry(self):
+        block = mixed_reset_block()
+        block["grants"][0]["ends_at"] = "2026-11-11T23:00:00+00:00"
+        grants = self.grants(block)
+        self.assertEqual(grants["available_count"], 3)
+        plain = self.extras(block)
+        self.assertNotIn("full reset", plain)
+        self.assertIn("3 Fable-specific resets, next expires", plain)
+
+    def test_group_specific_usability(self):
+        block = mixed_reset_block()
+        for grant in block["grants"][1:]:
+            grant["usable_now"] = False
+            grant["use_requires_limit"] = True
+        plain = self.extras(block)
+        self.assertNotIn("not usable", plain)
+        fable = plain.index("Fable-specific")
+        self.assertGreater(plain.index("usable once limited"), fable)
+
+    def test_unknown_scope_stays_explicit(self):
+        block = mixed_reset_block(full_left=0, extra_grants=[
+            unknown_grant(), unknown_grant(id="bare", clears=None)])
+        grants = self.grants(block)
+        self.assertEqual(grants["available_count"], 5)
+        unknown = next(group for group in grants["groups"]
+                       if group["scope"] == "unknown")
+        self.assertEqual(unknown["available_count"], 2)
+        plain = self.extras(block)
+        self.assertIn("2 resets of unknown scope, next expires", plain)
+        self.assertIn("3 Fable-specific resets", plain)
+
+    def test_display_and_json_agree(self):
+        body = {"five_hour": {"utilization": 1.0},
+                "cedar_ember": mixed_reset_block()}
+        with mock.patch.object(
+                llm_usage, "load_anthropic_token",
+                return_value={"access_token": "fixture",
+                              "subscription": "max"}), mock.patch.object(
+                llm_usage, "cached_fetch",
+                return_value=(200, body, None)), mock.patch.object(
+                llm_usage.time, "time", return_value=MIXED_NOW):
+            result = llm_usage._anthropic_json(
+                service_status_snapshot("anthropic"))
+        credits = result["rate_limit_reset_credits"]
+        self.assertEqual(credits["available_count"], 4)
+        self.assertEqual(
+            [(group["scope"], group["available_count"])
+             for group in credits["groups"]], [("full", 1), ("fable", 3)])
+        self.assertEqual([grant["scope"] for grant in credits["grants"]],
+                         ["full", "fable", "fable", "fable"])
+        texts = ["".join(segment["text"] for segment in part)
+                 for part in result["display"]["extras"]]
+        nouns = llm_usage.ANTHROPIC_RESET_SCOPE_NOUNS
+        expected = [f"{group['available_count']} "
+                    f"{nouns[group['scope']][group['available_count'] != 1]}"
+                    for group in credits["groups"]]
+        self.assertEqual([text.split(",")[0] for text in texts], expected)
+        json.dumps(result)
 
 
 class ProviderViewTests(unittest.TestCase):
