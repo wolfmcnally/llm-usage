@@ -229,6 +229,17 @@ class OpenAIUsageTests(unittest.TestCase):
         self.assertTrue(all(llm_usage.visible_len(line) <= 120
                             for line in lines))
 
+    def test_credit_balance_drops_trailing_decimal_zeros(self):
+        cases = {"5.000000": "5", "12.5000": "12.5", "42.5": "42.5",
+                 "100": "100", 7.25: "7.25", "-3.10": "-3.1"}
+        for raw, shown in cases.items():
+            with self.subTest(raw=raw):
+                body = json.loads(json.dumps(self.body))
+                body["credits"]["balance"] = raw
+                texts = ["".join(segment["text"] for segment in part)
+                         for part in llm_usage.openai_extras_parts(body)]
+                self.assertIn(f"credit balance {shown}", texts)
+
     def test_render_hides_untouched_extra_limits_and_shows_used_ones(self):
         body = json.loads(json.dumps(self.body))
         spark, reserve = body["additional_rate_limits"]

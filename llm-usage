@@ -1831,6 +1831,10 @@ def openai_extras_parts(body: dict) -> list[list[dict]]:
         parts.append([seg("credit limit reached", "critical")])
     elif credits.get("has_credits"):
         balance = credits.get("balance")
+        if balance is not None:
+            balance = str(balance)
+            if re.fullmatch(r"[+-]?\d+\.\d+", balance):
+                balance = balance.rstrip("0").rstrip(".")
         text = (f"credit balance {balance}"
                 if balance not in (None, "") else "credits available")
         parts.append([seg(text, "good")])
