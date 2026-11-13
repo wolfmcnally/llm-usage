@@ -1,3 +1,8 @@
 # Python bytecode cache
 __pycache__/
 *.py[cod]
+
+# Local agent and tool state
+.claude/worktrees/
+.codex/
+.playwright-mcp/
