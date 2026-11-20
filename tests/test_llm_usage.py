@@ -1189,5 +1189,321 @@ class HtmlOutputTests(unittest.TestCase):
             thread.join(timeout=5)
 
 
+ADVICE_NOW = MIXED_NOW
+ADVICE_RENEW = ADVICE_NOW + 67 * 3600   # 101h of the week elapsed (~60%)
+FABLE_END = "2027-03-09T07:59:00+00:00"
+
+
+def iso(epoch):
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat()
+
+
+def fable_grant(grant_id="fable-a", **overrides):
+    grant = {"id": grant_id, "label": "Launch: one Fable reset",
+             "resets_total": 1, "resets_left": 1,
+             "starts_at": "2026-11-09T18:00:00+00:00", "ends_at": FABLE_END,
+             "clears": ["seven_day_overage_included"], "paused": False,
+             "usable_now": True, "use_requires_limit": False, "type": "full",
+             "gives_back_weekly": True}
+    grant.update(overrides)
+    return grant
+
+
+def advice_body(overall=51, fable=59, cap=50, used=None, grants=None,
+                renew=ADVICE_RENEW, fable_renew=None, eligible=True,
+                shares=True, **block):
+    """Sanitized weekly meters in the shape observed 2026-11-20."""
+    if used is None:
+        used = cap * fable / 100
+    body = {"limits": [
+        {"kind": "session", "percent": 10,
+         "resets_at": iso(ADVICE_NOW + 3600), "scope": None},
+        {"kind": "weekly_all", "percent": overall, "resets_at": iso(renew),
+         "scope": None},
+        {"kind": "weekly_scoped", "percent": fable,
+         "resets_at": iso(fable_renew or renew),
+         "scope": {"model": {"id": None, "display_name": "Fable"},
+                   "surface": None}},
+    ], "cedar_ember": {
+        "grants": [fable_grant(), fable_grant("fable-b")]
+        if grants is None else grants,
+        "next_grant_id": "fable-a", "cooldown_until": None, **block}}
+    if eligible is not None:
+        body["cedar_ember"]["eligible"] = eligible
+    if shares:
+        body["weekly_scoped_shares"] = [
+            {"limit_index": 2, "used_percent_of_weekly": used,
+             "allowance_percent_of_weekly": cap}]
+    return body
+
+
+class FableResetAdviceTests(unittest.TestCase):
+    """Deterministic proof cases from briefs/fable-reset-timing.md."""
+
+    def advise(self, body, observed_at=ADVICE_NOW, now=ADVICE_NOW):
+        return llm_usage.anthropic_fable_reset_advice(body, observed_at, now)
+
+    def steady(self, advice, pace=1.0):
+        return next(s for s in advice["scenarios"] if s["pace"] == pace)
+
+    def text(self, advice):
+        return ["".join(llm_usage.seg_text(s) for s in line)
+                for line in llm_usage.fable_advice_lines(advice)]
+
+    def test_brief_snapshot_waits_and_converts_meters_exactly(self):
+        advice = self.advise(advice_body())
+        self.assertEqual(advice["action"], "wait")
+        self.assertFalse(advice["calibrated"])
+        self.assertAlmostEqual(advice["restored_overall_fraction"], 0.295)
+        self.assertAlmostEqual(advice["meters"]["other"], 0.215)
+        self.assertAlmostEqual(advice["fable_headroom_before"], 0.205)
+        self.assertAlmostEqual(advice["fable_headroom_after"], 0.5)
+        self.assertEqual(self.text(advice), [
+            "Fable reset: WAIT · ~98% of Fable cap by week end at steady "
+            "pace · now restores 30 pts · reset at cap (needs 1.0× pace) or "
+            "before a long Fable task"])
+        tones = [s["tone"] for s in llm_usage.fable_advice_lines(advice)[0]]
+        self.assertEqual(tones, ["sub", "good", "sub", "white", "sub", "sub",
+                                 "sub", "sub"])
+
+    def test_sub_cap_workload_gains_nothing_and_keeps_the_reset(self):
+        steady = self.steady(self.advise(advice_body()))
+        self.assertAlmostEqual(steady["gain_vs_wait"], 0.0)
+        self.assertAlmostEqual(steady["gain_vs_wait_if_away"], 0.0)
+        self.assertTrue(steady["wait_keeps_reset"])
+
+    def test_wait_comparator_redeems_at_the_cap_itself(self):
+        sim = llm_usage.fable_reset_simulation
+        rate = 0.4 / (60 * 3600)  # 40 pts of Fable over the next 60h
+        now = sim(0.3, 0.1, 0.5, rate, 0.0, 60 * 3600, "reset-now")
+        wait = sim(0.3, 0.1, 0.5, rate, 0.0, 60 * 3600, "wait")
+        self.assertAlmostEqual(now["work"], wait["work"])
+        self.assertAlmostEqual(wait["unmet"], 0.0)
+        self.assertFalse(wait["keeps_reset"])
+
+    def test_absent_at_the_cap_is_where_resetting_now_wins(self):
+        sim = llm_usage.fable_reset_simulation
+        rate = 0.4 / (60 * 3600)
+        now = sim(0.3, 0.1, 0.5, rate, 0.0, 60 * 3600, "reset-now")
+        away = sim(0.3, 0.1, 0.5, rate, 0.0, 60 * 3600, "wait",
+                   present=False)
+        self.assertAlmostEqual(now["work"] - away["work"], 0.2)
+
+    def test_projected_cap_says_reset_then_and_prices_absence(self):
+        advice = self.advise(advice_body(overall=70, fable=90))
+        self.assertEqual(advice["action"], "wait")
+        self.assertEqual(advice["binding"], "Fable")
+        self.assertEqual(self.text(advice), [
+            "Fable reset: WAIT · steady pace hits Fable cap in 11h 13m · "
+            "reset then: ~50 pts (45 pts now) · reset now only if away then "
+            "(saves ~25 pts)"])
+
+    def test_overall_cap_binding_first_keeps_other_model_use(self):
+        advice = self.advise(advice_body(overall=95, fable=40))
+        self.assertEqual(advice["binding"], "weekly")
+        self.assertAlmostEqual(advice["meters"]["other"], 0.75)
+        self.assertTrue(self.text(advice)[0].startswith(
+            "Fable reset: WAIT · steady pace hits weekly cap in 5h 18m · "))
+        at_cap = self.advise(advice_body(overall=100, fable=50))
+        self.assertEqual(at_cap["action"], "reset-if-needed")
+        self.assertEqual(self.text(at_cap), [
+            "Fable reset: RESET IF NEEDED · weekly cap reached · restores 25 "
+            "pts · only if you have Fable work before the weekly reset in "
+            "2d 19h · other models' 75 pts stay"])
+        tones = [s["tone"] for s in llm_usage.fable_advice_lines(at_cap)[0]]
+        self.assertEqual(tones[:4], ["sub", "caution", "sub", "white"])
+
+    def test_fable_cap_reached_is_conditional_never_unconditional(self):
+        advice = self.advise(advice_body(overall=60, fable=100))
+        self.assertEqual(advice["action"], "reset-if-needed")
+        self.assertEqual(self.text(advice), [
+            "Fable reset: RESET IF NEEDED · Fable cap reached · restores 50 "
+            "pts · only if you have Fable work before the weekly reset in "
+            "2d 19h"])
+
+    def test_cap_with_no_demand_gains_nothing_from_resetting(self):
+        advice = self.advise(advice_body(overall=60, fable=100))
+        idle = self.steady(advice, 0.0)
+        self.assertAlmostEqual(idle["gain_vs_wait"], 0.0)
+        self.assertAlmostEqual(idle["gain_vs_wait_if_away"], 0.0)
+        self.assertTrue(idle["wait_keeps_reset"])
+        # With demand, a present WAIT redeems at the cap itself.
+        self.assertAlmostEqual(self.steady(advice)["gain_vs_wait"], 0.0)
+        self.assertGreater(self.steady(advice)["gain_vs_wait_if_away"], 0.0)
+
+    def test_expiry_before_next_decision_point_is_conditional(self):
+        grants = [fable_grant(ends_at=iso(ADVICE_NOW + 9 * 3600))]
+        advice = self.advise(advice_body(grants=grants))
+        self.assertEqual(advice["action"], "reset-if-needed")
+        self.assertEqual(self.text(advice), [
+            "Fable reset: RESET IF NEEDED · a reset expires in 9h 00m, before "
+            "the weekly reset · restores 30 pts · only if you have Fable work "
+            "before then"])
+
+    def test_expiry_with_no_demand_gains_nothing_from_resetting(self):
+        grants = [fable_grant(ends_at=iso(ADVICE_NOW + 9 * 3600))]
+        idle = self.steady(self.advise(advice_body(grants=grants)), 0.0)
+        self.assertAlmostEqual(idle["gain_vs_wait"], 0.0)
+        self.assertAlmostEqual(idle["gain_vs_wait_if_away"], 0.0)
+
+    def test_absent_wait_cannot_redeem_at_expiry(self):
+        sim = llm_usage.fable_reset_simulation
+        rate = 0.3 / (60 * 3600)  # fits only after a reset
+        args = (0.4, 0.1, 0.5, rate, 0.0, 60 * 3600, "wait")
+        present = sim(*args, expires_in=3600)
+        away = sim(*args, expires_in=3600, present=False)
+        self.assertFalse(present["keeps_reset"])
+        self.assertFalse(away["keeps_reset"])
+        self.assertAlmostEqual(present["work"], 0.3)
+        self.assertAlmostEqual(away["work"], 0.1)  # lapsed, never redeemed
+
+    def test_later_expiry_before_renewal_is_flagged_on_wait(self):
+        grants = [fable_grant(ends_at=iso(ADVICE_NOW + 40 * 3600))]
+        advice = self.advise(advice_body(grants=grants))
+        self.assertEqual(advice["action"], "wait")
+        self.assertTrue(self.text(advice)[0].endswith(
+            " · a reset expires in 1d 16h: use it by then"))
+        self.assertFalse(self.steady(advice)["wait_keeps_reset"])
+
+    def test_renewal_first_retains_the_grant(self):
+        advice = self.advise(advice_body())
+        self.assertFalse(advice["expires_before_renewal"])
+        self.assertNotIn("expires", self.text(advice)[0])
+
+    def test_unusable_or_unavailable_grants_are_never_offered(self):
+        paused = advice_body(grants=[fable_grant(paused=True)])
+        self.assertIsNone(self.advise(paused))
+        expired = advice_body(grants=[fable_grant(
+            ends_at=iso(ADVICE_NOW - 60))])
+        self.assertIsNone(self.advise(expired))
+        cases = (
+            ({"usable_now": False}, {}, "not redeemable right now"),
+            ({"usable_now": False, "use_requires_limit": True}, {},
+             "redeemable once Fable hits its cap"),
+        )
+        for grant, block, reason in cases:
+            with self.subTest(reason):
+                advice = self.advise(advice_body(
+                    grants=[fable_grant(**grant)], **block))
+                self.assertEqual((advice["action"], advice["reason"]),
+                                 ("wait", reason))
+                self.assertEqual(self.text(advice),
+                                 [f"Fable reset: WAIT · {reason}"])
+        cooling = advice_body(grants=[fable_grant(usable_now=False)])
+        cooling["cedar_ember"]["cooldown_until"] = iso(ADVICE_NOW + 5400)
+        self.assertEqual(self.text(self.advise(cooling)),
+                         ["Fable reset: WAIT · cooling down for 1h 30m"])
+
+    def test_missing_vs_confirmed_eligibility(self):
+        missing = self.advise(advice_body(eligible=None))
+        self.assertEqual(missing["action"], "insufficient-evidence")
+        self.assertEqual(self.text(missing), [
+            "Fable reset: no advice · eligibility not reported"])
+        denied = self.advise(advice_body(eligible=False))
+        self.assertEqual((denied["action"], denied["reason"]),
+                         ("wait", "account reports resets unavailable"))
+
+    def test_inconsistent_unknown_or_stale_input_abstains(self):
+        cases = (
+            ("meters disagree", advice_body(used=40),
+             "weekly meters disagree"),
+            ("cap missing", advice_body(shares=False),
+             "Fable cap not reported"),
+            ("clocks differ", advice_body(fable_renew=ADVICE_RENEW + 7200),
+             "weekly meters renew at different times"),
+            ("other use negative", advice_body(overall=20, fable=59),
+             "weekly meters disagree"),
+            ("reset clock differs", advice_body(
+                weekly_resets_at=iso(ADVICE_RENEW + 86400)),
+             "reset and usage clocks disagree"),
+        )
+        for name, body, reason in cases:
+            with self.subTest(name):
+                advice = self.advise(body)
+                self.assertEqual(advice["action"], "insufficient-evidence")
+                self.assertEqual(advice["reason"], reason)
+                self.assertIsNone(advice["restored_overall_fraction"])
+        stale = self.advise(advice_body(), observed_at=ADVICE_NOW - 7200)
+        self.assertEqual(self.text(stale), [
+            "Fable reset: no advice · usage snapshot is 2h 00m old"])
+        rolled = self.advise(advice_body(renew=ADVICE_NOW - 60),
+                             observed_at=ADVICE_NOW - 120)
+        self.assertEqual(rolled["reason"],
+                         "weekly window changed since this snapshot")
+        unlabelled = advice_body()
+        unlabelled["limits"][2]["scope"]["model"]["display_name"] = "Opus"
+        self.assertEqual(self.advise(unlabelled)["reason"],
+                         "weekly Fable meter not reported")
+
+    def test_early_week_and_nothing_to_restore(self):
+        early_grants = [fable_grant(starts_at="2026-10-01T00:00:00+00:00")]
+        early = self.advise(advice_body(overall=3, fable=4,
+                                        grants=early_grants),
+                            now=ADVICE_RENEW - 7 * 86400 + 3600,
+                            observed_at=ADVICE_RENEW - 7 * 86400 + 3600)
+        self.assertEqual(self.text(early), [
+            "Fable reset: WAIT · too early in the week to judge pace · now "
+            "restores 2 pts · reset once Fable nears its cap"])
+        idle = self.advise(advice_body(overall=10, fable=0))
+        self.assertEqual(self.text(idle), [
+            "Fable reset: WAIT · no Fable usage to restore yet"])
+
+    def test_absent_without_fable_resets(self):
+        for name, body in (
+                ("no grant block", {"limits": advice_body()["limits"]}),
+                ("full only", advice_body(grants=[fable_grant(
+                    clears=["seven_day"], label="One full limit reset")])),
+                ("unknown only", advice_body(grants=[unknown_grant()])),
+                ("spent", advice_body(grants=[fable_grant(resets_left=0)]))):
+            with self.subTest(name):
+                self.assertIsNone(self.advise(body))
+                self.assertEqual(llm_usage.fable_advice_lines(None), [])
+
+    def snapshot_view(self, body):
+        snapshot = {"token": {"access_token": "fixture",
+                              "subscription": "max"},
+                    "code": 200, "body": body, "age": 60.0,
+                    "loaded_at": ADVICE_NOW}
+        with mock.patch.object(llm_usage.time, "time",
+                               return_value=ADVICE_NOW):
+            return llm_usage.provider_view("anthropic", snapshot)
+
+    def test_view_json_and_terminal_carry_advice_only_when_present(self):
+        view = self.snapshot_view(advice_body())
+        self.assertEqual(view["fable_reset_advice"]["action"], "wait")
+        self.assertEqual(len(view["display"]["advice"]), 1)
+        json.dumps(view)
+        with mock.patch.object(llm_usage.time, "time",
+                               return_value=ADVICE_NOW):
+            lines, ok = llm_usage.render_provider_section(view, 160)
+            narrow, _ = llm_usage.render_provider_section(view, 60)
+        plain = [llm_usage.ANSI_RE.sub("", line) for line in lines]
+        self.assertTrue(ok)
+        self.assertIn("  Fable reset: WAIT · ~98% of Fable cap by week end "
+                      "at steady pace · now restores 30 pts · reset at cap "
+                      "(needs 1.0× pace) or before a long Fable task", plain)
+        # Narrow terminals wrap the same line instead of clipping it.
+        wrapped = [llm_usage.ANSI_RE.sub("", line) for line in narrow]
+        start = next(i for i, line in enumerate(wrapped)
+                     if line.startswith("  Fable reset:"))
+        joined = " ".join(line.strip() for line in wrapped[start:start + 3])
+        self.assertTrue(joined.endswith("before a long Fable task"))
+        self.assertTrue(all(len(line) <= 60 for line in wrapped))
+        absent = self.snapshot_view(advice_body(grants=[]))
+        self.assertIsNone(absent["fable_reset_advice"])
+        self.assertEqual(absent["display"]["advice"], [])
+        with mock.patch.object(llm_usage.time, "time",
+                               return_value=ADVICE_NOW):
+            lines, _ = llm_usage.render_provider_section(absent, 140)
+        self.assertFalse(any("Fable reset" in line for line in lines))
+
+    def test_html_page_lays_out_advice_block(self):
+        page = llm_usage.build_html_page({}, "static")
+        self.assertIn('h("p", "advice"', page)
+        self.assertIn(".advice{margin:8px 0 0;font-size:12px;", page)
+        self.assertIn(".advice span{font-size:inherit;", page)
+
+
 if __name__ == "__main__":
     unittest.main()

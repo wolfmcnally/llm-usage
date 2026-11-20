@@ -1663,6 +1663,370 @@ def anthropic_spend_parts(body: dict) -> list[list[dict]]:
     return parts
 
 
+# ------------------------------------------------- Fable reset advice ----
+#
+# First cut of briefs/fable-reset-timing.md: weekly limits only, one
+# decision (spend a Fable-specific reset now, or wait and keep the option),
+# from one snapshot. Numbers are deterministic scenario outcomes, never
+# empirical probabilities: a snapshot carries no demand history, so the
+# advice is `calibrated: false` and says which assumption decides it.
+
+FABLE_ADVICE_MODEL = "fable-reset-scenario-1"
+FABLE_ADVICE_MAX_AGE = 3600        # older snapshots cannot prove eligibility
+FABLE_ADVICE_CLOCK_TOLERANCE = 300  # weekly meters must renew together
+FABLE_ADVICE_ROUNDING = 0.015      # integer-percent meters, overall units
+FABLE_ADVICE_MIN_GAIN = 0.01       # smallest restore worth a grant (1 pt)
+FABLE_ADVICE_GRID = 12 * 3600      # assumed gap to the next decision point
+FABLE_ADVICE_MIN_ELAPSED = 6 * 3600  # less week than this: no pace estimate
+FABLE_ADVICE_STEP = 3600           # scenario simulation step
+FABLE_ADVICE_PACES = (0.0, 1.0, 1.5, 2.0)  # multiples of observed pace
+WEEK_SECONDS = 7 * 86400
+FABLE_ADVICE_ASSUMPTIONS = (
+    "weekly limits only; the 5-hour limit is excluded",
+    "provider-reported Fable cap; a reset clears Fable use in both weekly "
+    "meters, keeps other-model use, and keeps the renewal time and caps",
+    "steady pace = average use per hour since the week started; scenarios "
+    "scale it, they are not a demand forecast",
+    "waiting may redeem at the cap or at expiry, only while you are there",
+    "no workload is known, so a reset is only ever advised conditionally",
+    "the next decision point is assumed within 12h",
+    "an unused reset survives renewal until its own expiry",
+)
+
+
+def _real_number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    return value if value == value and abs(value) != float("inf") else None
+
+
+def fable_weekly_meters(body: dict) -> tuple[dict | None, str | None]:
+    """Both weekly meters and the Fable cap, in overall-allowance units.
+
+    Uses only the generic `limits[]` entries and the provider's own
+    `weekly_scoped_shares` row linked to the Fable limit by index; nothing
+    is defaulted. Returns (meters, None) or (None, reason to abstain).
+    """
+    limits = body.get("limits")
+    if not isinstance(limits, list):
+        return None, "weekly limits not reported"
+    overall, fable = [], []
+    for index, limit in enumerate(limits):
+        if not isinstance(limit, dict):
+            continue
+        if limit.get("kind") == "weekly_all":
+            overall.append(limit)
+        elif limit.get("kind") == "weekly_scoped":
+            scope = limit.get("scope")
+            model = scope.get("model") if isinstance(scope, dict) else None
+            name = model.get("display_name") if isinstance(model, dict) else None
+            if isinstance(name, str) and "fable" in name.lower():
+                fable.append((index, limit))
+    if len(overall) != 1 or len(fable) != 1:
+        return None, "weekly Fable meter not reported"
+    fable_index, fable_limit = fable[0]
+    shares = body.get("weekly_scoped_shares")
+    rows = [row for row in shares if isinstance(row, dict)
+            and row.get("limit_index") == fable_index] if isinstance(
+                shares, list) else []
+    if len(rows) != 1:
+        return None, "Fable cap not reported"
+    w = _real_number(overall[0].get("percent"))
+    f = _real_number(fable_limit.get("percent"))
+    cap = _real_number(rows[0].get("allowance_percent_of_weekly"))
+    used = _real_number(rows[0].get("used_percent_of_weekly"))
+    if None in (w, f, cap, used):
+        return None, "weekly meters incomplete"
+    if not 0 < cap <= 100:
+        return None, "Fable cap out of range"
+    tolerance = FABLE_ADVICE_ROUNDING * 100
+    if (min(w, f, used) < 0 or w > 100 + tolerance or f > 100 + tolerance
+            or abs(used - cap * f / 100) > tolerance
+            or used > w + tolerance):
+        return None, "weekly meters disagree"
+    renews = _aware_epoch(overall[0].get("resets_at"))
+    fable_renews = _aware_epoch(fable_limit.get("resets_at"))
+    if renews is None or fable_renews is None:
+        return None, "weekly renewal time not reported"
+    if abs(renews - fable_renews) > FABLE_ADVICE_CLOCK_TOLERANCE:
+        return None, "weekly meters renew at different times"
+    c, w, x = cap / 100, w / 100, used / 100
+    return {"overall": w, "fable_of_cap": f / 100, "cap": c, "fable": x,
+            "other": max(0.0, w - x), "renews_at": renews}, None
+
+
+def fable_reset_simulation(fable: float, other: float, cap: float,
+                           fable_rate: float, other_rate: float,
+                           horizon: float, policy: str,
+                           expires_in: float | None = None,
+                           present: bool = True,
+                           step: float = FABLE_ADVICE_STEP) -> dict:
+    """Deterministic weekly work under one fixed demand path and policy.
+
+    Units are fractions of one overall weekly allowance; rates are per
+    second. `policy` is "reset-now" (redeem at t=0) or "wait" (redeem,
+    only while `present`, when the next step would not fit or the grant
+    is about to expire before the horizon). Each step's demand is divisible: what does not fit is lost
+    for the week (`unmet`). Fable is served before other models.
+    """
+    x, y, t = fable, other, 0.0
+    grant = True
+    done = unmet = 0.0
+    if policy == "reset-now":
+        x, grant = 0.0, False
+    while t < horizon - 1e-9:
+        dt = min(step, horizon - t)
+        df, do = fable_rate * dt, other_rate * dt
+        expiring = (expires_in is not None and t + dt >= expires_in)
+        blocked = x + df > cap + 1e-12 or x + y + df + do > 1 + 1e-12
+        if grant and x > 0 and present and (blocked or expiring):
+            x, grant = 0.0, False
+        if expiring:
+            grant = False
+        got_f = max(0.0, min(df, cap - x, 1 - x - y))
+        got_o = max(0.0, min(do, 1 - x - y - got_f))
+        x, y = x + got_f, y + got_o
+        done += got_f + got_o
+        unmet += (df - got_f) + (do - got_o)
+        t += dt
+    return {"work": done, "unmet": unmet, "keeps_reset": grant}
+
+
+def _fable_points(value: float) -> str:
+    return f"{max(0, round(value * 100))} pts"
+
+
+def anthropic_fable_reset_advice(body: dict, observed_at: float,
+                                 now: float | None = None) -> dict | None:
+    """Reset-now vs wait advice; None unless a Fable-specific reset is
+    available (per `anthropic_reset_grants`)."""
+    if now is None:
+        now = time.time()
+    grants = anthropic_reset_grants(body, now)
+    group = next((g for g in (grants or {}).get("groups", [])
+                  if g["scope"] == "fable"), None)
+    if not group or group["available_count"] <= 0:
+        return None
+    available = [g for g in grants["grants"]
+                 if g["scope"] == "fable" and g["available"]]
+    advice: dict[str, Any] = {
+        "model_version": FABLE_ADVICE_MODEL, "calibrated": False,
+        "available_count": group["available_count"],
+        "observed_at": observed_at, "evaluated_at": now,
+        "assumptions": list(FABLE_ADVICE_ASSUMPTIONS),
+        "restored_overall_fraction": None, "reconsider_at": None,
+        "scenarios": [],
+    }
+
+    def result(action: str, reason: str, **extra: Any) -> dict:
+        advice.update(action=action, reason=reason, **extra)
+        return advice
+
+    age = now - observed_at
+    if age > FABLE_ADVICE_MAX_AGE:
+        return result("insufficient-evidence",
+                      f"usage snapshot is {fmt_relative(age)} old")
+    raw = body.get("cedar_ember") or {}
+    if raw.get("eligible") is not True:
+        if raw.get("eligible") is False:
+            return result("wait", "account reports resets unavailable")
+        return result("insufficient-evidence", "eligibility not reported")
+    meters, why = fable_weekly_meters(body)
+    if meters is None:
+        return result("insufficient-evidence", why)
+    renews = meters["renews_at"]
+    week_start = renews - WEEK_SECONDS
+    if renews <= now or not week_start < observed_at <= renews:
+        return result("insufficient-evidence",
+                      "weekly window changed since this snapshot")
+    weekly_reset = raw.get("weekly_resets_at")
+    if weekly_reset is not None:
+        epoch = _aware_epoch(weekly_reset)
+        if epoch is None or abs(epoch - renews) > FABLE_ADVICE_CLOCK_TOLERANCE:
+            return result("insufficient-evidence",
+                          "reset and usage clocks disagree")
+    x, y, c, w = (meters["fable"], meters["other"], meters["cap"],
+                  meters["overall"])
+    advice.update(meters={k: v for k, v in meters.items()},
+                  restored_overall_fraction=x,
+                  fable_headroom_before=max(0.0, min(c - x, 1 - w)),
+                  fable_headroom_after=max(0.0, min(c, 1 - y)))
+    next_grant = next((g for g in available
+                       if g["id"] == group["next_grant_id"]), None)
+    cooldown = _aware_epoch(raw.get("cooldown_until"))
+    if not group["usable_now"] or next_grant is None:
+        if cooldown is not None and cooldown > now:
+            return result("wait", "cooling down", reconsider_at=cooldown)
+        if group["use_requires_limit"]:
+            return result("wait", "redeemable once Fable hits its cap")
+        return result("wait", "not redeemable right now")
+    remaining = renews - now
+    expiry = min(g["ends_at_epoch"] for g in available)
+    expires_first = expiry < renews
+    advice["expires_before_renewal"] = expires_first
+    advice["next_expires_at"] = expiry
+    advice["renews_at"] = renews
+    if x < FABLE_ADVICE_MIN_GAIN:
+        return result("wait", "no Fable usage to restore yet")
+    elapsed = observed_at - week_start
+    fable_rate, other_rate = x / elapsed, y / elapsed
+    expires_in = expiry - now if expires_first else None
+    for pace in (FABLE_ADVICE_PACES if elapsed >= FABLE_ADVICE_MIN_ELAPSED
+                 else ()):
+        runs = {}
+        for name, policy, present in (("now", "reset-now", True),
+                                      ("wait", "wait", True),
+                                      ("wait_away", "wait", False)):
+            runs[name] = fable_reset_simulation(
+                x, y, c, fable_rate * pace, other_rate * pace, remaining,
+                policy, expires_in, present)
+        advice["scenarios"].append({
+            "pace": pace,
+            "gain_vs_wait": runs["now"]["work"] - runs["wait"]["work"],
+            "gain_vs_wait_if_away": (runs["now"]["work"]
+                                     - runs["wait_away"]["work"]),
+            "wait_keeps_reset": runs["wait"]["keeps_reset"],
+        })
+    # Without known workload a reset is never unconditional: at the cap, or
+    # with a grant about to lapse, it pays only if Fable work is pending.
+    if advice["fable_headroom_before"] <= FABLE_ADVICE_ROUNDING:
+        binding = "Fable" if c - x <= 1 - w else "weekly"
+        return result("reset-if-needed", f"the {binding} cap is reached",
+                      binding=binding)
+    if expires_first and expiry - now <= FABLE_ADVICE_GRID:
+        return result("reset-if-needed", "a Fable reset expires before the "
+                      "next decision point and the weekly renewal")
+    if not advice["scenarios"]:
+        return result("wait", "too early in the week to judge pace")
+    steady = next(s for s in advice["scenarios"] if s["pace"] == 1.0)
+    to_fable_cap = (c - x) / fable_rate
+    total_rate = fable_rate + other_rate
+    to_weekly_cap = (1 - w) / total_rate if total_rate else float("inf")
+    to_cap = min(to_fable_cap, to_weekly_cap)
+    binding = "Fable" if to_fable_cap <= to_weekly_cap else "weekly"
+    advice["binding"] = binding
+    if to_cap >= remaining:
+        needed = min((c - x) / (fable_rate * remaining),
+                     (1 - w) / (total_rate * remaining))
+        return result("wait", "steady pace stays under both weekly caps",
+                      projected_fable_of_cap=(x + fable_rate * remaining) / c,
+                      pace_needed_for_cap=needed)
+    restore_at_cap = c if binding == "Fable" else x + fable_rate * to_cap
+    return result("wait", f"steady pace reaches the {binding} cap before "
+                  "renewal; resetting then restores more",
+                  reconsider_at=now + to_cap,
+                  restore_at_cap=restore_at_cap,
+                  saved_if_away=steady["gain_vs_wait_if_away"])
+
+
+def fable_advice_lines(advice: dict | None) -> list[list[dict]]:
+    """Display for Fable reset advice: one line of bullet-separated
+    clauses (a list holding one run of segments), or [] without advice.
+    Renderers wrap it; they do not split it into rows."""
+    if not advice:
+        return []
+    action, reason = advice["action"], advice["reason"]
+    now = advice["evaluated_at"]
+    if action == "insufficient-evidence":
+        verb, clauses = seg("no advice", "dim"), [seg(reason, "dim")]
+    else:
+        verb = (seg("RESET IF NEEDED", "caution")
+                if action == "reset-if-needed" else seg("WAIT", "good"))
+        clauses = _fable_advice_clauses(advice, action, reason, now)
+    line = [seg("Fable reset: ", "sub"), verb]
+    for clause in clauses:
+        line += [seg(" · ", "sub"), clause]
+    return [line]
+
+
+def _fable_advice_clauses(advice: dict, action: str, reason: str,
+                          now: float) -> list[dict]:
+    restore = advice.get("restored_overall_fraction")
+    clauses: list[dict] = []
+    if action == "reset-if-needed":
+        if advice.get("binding"):
+            clauses = [
+                seg(f"{advice['binding']} cap reached", "white"),
+                seg(f"restores {_fable_points(restore)}", "sub"),
+                seg("only if you have Fable work before the weekly reset "
+                    "in ", "sub", advice["renews_at"] - now)]
+            other = advice["meters"]["other"]
+            if (advice["binding"] == "weekly"
+                    and other >= FABLE_ADVICE_MIN_GAIN):
+                clauses.append(seg(f"other models' {_fable_points(other)} "
+                                   "stay", "sub"))
+        else:
+            clauses = [
+                seg("a reset expires in ", "white",
+                    advice["next_expires_at"] - now,
+                    after=", before the weekly reset"),
+                seg(f"restores {_fable_points(restore)}", "sub"),
+                seg("only if you have Fable work before then", "sub")]
+        return clauses
+    if "projected_fable_of_cap" in advice:
+        projected = min(advice["projected_fable_of_cap"], 1.0)
+        clauses = [
+            seg(f"~{round(projected * 100)}% of Fable cap by week end at "
+                "steady pace", "white"),
+            seg(f"now restores {_fable_points(restore)}", "sub"),
+            seg(f"reset at cap (needs "
+                f"{advice['pace_needed_for_cap']:.1f}× pace) or before a "
+                "long Fable task", "sub")]
+    elif advice.get("reconsider_at") and "restore_at_cap" in advice:
+        clauses = [
+            seg(f"steady pace hits {advice['binding']} cap in ", "white",
+                advice["reconsider_at"] - now),
+            seg(f"reset then: ~{_fable_points(advice['restore_at_cap'])} "
+                f"({_fable_points(restore)} now)", "sub")]
+        away = advice["saved_if_away"]
+        if away >= FABLE_ADVICE_MIN_GAIN:
+            clauses.append(seg(f"reset now only if away then (saves "
+                               f"~{_fable_points(away)})", "sub"))
+    elif advice.get("reconsider_at"):
+        clauses = [seg(f"{reason} for ", "white",
+                       advice["reconsider_at"] - now)]
+    else:
+        clauses = [seg(reason, "white")]
+        if restore is not None and reason.startswith("too early"):
+            clauses += [seg(f"now restores {_fable_points(restore)}", "sub"),
+                        seg("reset once Fable nears its cap", "sub")]
+    if advice.get("expires_before_renewal"):
+        clauses.append(seg("a reset expires in ", "caution",
+                           advice["next_expires_at"] - now,
+                           after=": use it by then"))
+    return clauses
+
+
+def wrap_segments(segments: list[dict], width: int, indent: str = "  "
+                  ) -> list[str]:
+    """Word-wrap one run of segments into ANSI terminal lines."""
+    words: list[tuple[str, str]] = []  # (text incl. leading space, tone)
+    for segment in segments:
+        for piece in re.split(r"( +)", seg_text(segment)):
+            if piece:
+                words.append((piece, segment["tone"]))
+    lines, current, used = [], [], 0
+    room = max(10, width - len(indent))
+    for text, tone in words:
+        if text.isspace():
+            if current:
+                current.append((text, tone))
+                used += len(text)
+            continue
+        if current and used + len(text) > room:
+            while current and current[-1][0].isspace():
+                current.pop()
+            lines.append(current)
+            current, used = [], 0
+        current.append((text, tone))
+        used += len(text)
+    if current:
+        lines.append(current)
+    return [indent + "".join(f"{TONES[tone]}{text}{RESET}"
+                             for text, tone in line) for line in lines]
+
+
 def anthropic_snapshot() -> dict:
     loaded_at = time.time()
     tok = load_anthropic_token()
@@ -1965,10 +2329,14 @@ def _anthropic_view_data(snapshot: dict, display: dict) -> dict:
         display["rows"].append(usage_row(
             band["label"], band["utilization"], band["window_seconds"], rem))
     display["extras"] = anthropic_extras_parts(body)
+    observed_at = snapshot["loaded_at"] - (snapshot.get("age") or 0.0)
+    advice = anthropic_fable_reset_advice(body, observed_at)
+    display["advice"] = fable_advice_lines(advice)
     return {"ok": True, "error": None,
             "subscription": tok.get("subscription"), "windows": windows,
             "usage_credits": normalize_anthropic_spend(body),
             "rate_limit_reset_credits": anthropic_reset_grants(body),
+            "fable_reset_advice": advice,
             "oauth_expires_at_ms": tok.get("expires_at_ms")}
 
 
@@ -2097,6 +2465,7 @@ def provider_view(provider: str, snapshot: dict) -> dict:
         "error": None,
         "alerts": [],
         "extras": [],
+        "advice": [],
         "rows": [],
     }
     tok = snapshot.get("token")
@@ -2155,6 +2524,8 @@ def render_provider_section(view: dict, width: int
     extras = extras_line(d["extras"])
     if extras:
         lines.append(extras)
+    for advice in d.get("advice") or []:
+        lines.extend(wrap_segments(advice, width))
     lines.extend("  " + seg_ansi(alert) for alert in d["alerts"])
     rows = [item for item in d["rows"] if item["type"] == "row"]
     label_w, pct_w = row_layout_widths(rows, width)
@@ -2316,6 +2687,8 @@ main{display:grid;gap:18px;
 .extras{margin-top:12px;padding-top:10px;border-top:1px solid var(--hairline);
   font-size:12px;color:var(--ink2);display:flex;flex-wrap:wrap;gap:2px 7px}
 .x-label{color:var(--muted)}
+.advice{margin:8px 0 0;font-size:12px;line-height:1.45;color:var(--ink2)}
+.advice span{font-size:inherit;font-weight:inherit}
 footer{margin-top:28px;color:var(--muted);font-size:12px;
   display:flex;flex-direction:column;gap:9px}
 .legend{display:flex;gap:6px 16px;flex-wrap:wrap}
@@ -2510,6 +2883,10 @@ function card(name, p) {
   if (d.extras.length) {
     c.appendChild(h("div", "extras", h("span", "x-label", "extras"),
       ...metaSegs(...d.extras.map(partEl))));
+  }
+  if ((d.advice || []).length) {
+    // One inline paragraph that wraps naturally; bullets are in the text.
+    c.appendChild(h("p", "advice", ...[].concat(...d.advice).map(segEl)));
   }
   return c;
 }

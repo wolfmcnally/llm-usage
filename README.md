@@ -54,7 +54,13 @@ credits are enabled, have recorded spending, or need attention; ordinary
 disabled states stay hidden. Banked Anthropic usage-limit resets are broken out
 by what they restore — full resets versus Fable-specific resets, with any grant
 whose scope cannot be identified shown as being of unknown scope — each with
-its own next expiration. OpenAI reports purchased-credit status and
+its own next expiration. When a Fable-specific reset is available, a short
+`Fable reset:` line below it advises whether to spend one now or wait, from the
+weekly meters and the provider-reported Fable cap: WAIT (with when the cap
+arrives at steady pace), RESET IF NEEDED (cap reached, or a reset about to
+lapse — worth it only if Fable work is pending), or no advice when the
+snapshot is stale, incomplete, or inconsistent. It never recommends an
+unconditional reset, since the dashboard cannot see your workload. OpenAI reports purchased-credit status and
 available usage-limit resets. When the installed Codex app server supplies
 complete reset-credit details, the earliest expiration is shown in local time
 and urgency-colored; expirations within three days also include a relative
