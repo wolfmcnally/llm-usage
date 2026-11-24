@@ -1718,7 +1718,101 @@ class LegendPlacementTests(unittest.TestCase):
         self.assertLess(page.index('<div class="legend">'),
                         page.index('<main id="providers"'))
         self.assertNotIn("<footer>", page)
-        self.assertIn('card("GOOGLE ANTIGRAVITY", data.antigravity)', page)
+        self.assertIn('card("antigravity", "GOOGLE ANTIGRAVITY",', page)
+
+
+def summary_rows(*specs):
+    """Rows as (label, utilization, now_pct, reset_seconds) or a heading str."""
+    rows = []
+    for spec in specs:
+        if isinstance(spec, str):
+            rows.append({"type": "heading", "text": spec, "badges": []})
+        else:
+            label, util, now, reset = spec
+            rows.append({"type": "row", "label": label, "utilization": util,
+                         "now_pct": now, "reset_seconds": reset})
+    return rows
+
+
+class SummaryRowTests(unittest.TestCase):
+    """The collapsed-card bar: most likely to exhaust before reset."""
+
+    def pick(self, *specs):
+        row = llm_usage.summary_row(summary_rows(*specs))
+        return row and (row["label"], row["basis"], row["score"])
+
+    def test_projected_pace_outranks_higher_current_usage(self):
+        # 40% used at 20% of the window projects to 200%; 70% at 90% to ~78%.
+        self.assertEqual(
+            self.pick(("7-day", 70, 90, 100), ("5-hour", 40, 20, 50)),
+            ("5-hour", "projected", 200.0))
+
+    def test_early_or_unknown_pace_falls_back_to_current_usage(self):
+        self.assertEqual(
+            self.pick(("A", 3, 2, 100), ("B", 30, None, None)),
+            ("B", "current", 30.0))
+        self.assertEqual(self.pick(("A", 3, 2, 100)), ("A", "current", 3.0))
+
+    def test_fixed_tie_breakers(self):
+        # Equal projection: higher usage, then sooner reset, then order.
+        self.assertEqual(self.pick(("A", 20, 40, 10), ("B", 40, 80, 10))[0],
+                         "B")
+        self.assertEqual(self.pick(("A", 20, 40, 90), ("B", 20, 40, 10))[0],
+                         "B")
+        self.assertEqual(self.pick(("A", 20, 40, None), ("B", 20, 40, None))[0],
+                         "A")
+
+    def test_heading_is_kept_and_unusable_rows_are_ignored(self):
+        rows = summary_rows("Gemini Models", ("7-day", 10, 50, 5),
+                            "Claude and GPT models", ("7-day", 30, 50, 5))
+        rows.append({"type": "row", "label": "broken", "utilization": None})
+        rows.append({"type": "row", "label": "text", "utilization": "90"})
+        self.assertEqual(llm_usage.summary_row(rows)["label"],
+                         "Claude and GPT models · 7-day")
+        self.assertIsNone(llm_usage.summary_row(summary_rows("Only heading")))
+        self.assertIsNone(llm_usage.summary_row([]))
+
+    def test_views_carry_the_summary(self):
+        with mock.patch.object(llm_usage.time, "time", return_value=AGY_NOW):
+            view = llm_usage.antigravity_view(agy_snapshot())
+        # 25% used with a seventh of the week gone projects to 175%, ahead
+        # of 60% in a 5-hour window that has not started (no pace yet).
+        summary = view["display"]["summary"]
+        self.assertEqual((summary["label"], summary["basis"], summary["score"]),
+                         ("Fixture Models · 7-day", "projected", 175.0))
+        failed = llm_usage.antigravity_view(agy_snapshot(None, {"error": "x"}))
+        self.assertIsNone(failed["display"]["summary"])
+        body = json.loads(ANTHROPIC_FIXTURE_PATH.read_text())
+        snapshot = {"token": {"access_token": "fixture"}, "code": 200,
+                    "body": body, "age": None, "loaded_at": 1000.0}
+        anthropic = llm_usage.provider_view("anthropic", snapshot)
+        labels = [r["label"] for r in anthropic["display"]["rows"]
+                  if r["type"] == "row"]
+        self.assertIn(anthropic["display"]["summary"]["label"], labels)
+
+    def test_page_has_native_disclosure_with_state_and_focus(self):
+        page = llm_usage.build_html_page({}, "static")
+        for needle in ('h("button", "disc"', 'btn.type = "button"',
+                       '"aria-expanded"', '"aria-controls"',
+                       "const collapsed = loadCollapsed();", "collapsed[key] = open;",
+                       "again.focus(", ".disc:focus-visible{",
+                       "rowEl(d.summary)", "saveCollapsed();",
+                       'const DISCLOSURE_KEY = "llm-usage.collapsed";',
+                       "saved[id] === true"):
+            self.assertIn(needle, page)
+
+
+    def test_closed_card_keeps_only_abnormal_service_line(self):
+        page = llm_usage.build_html_page({}, "static")
+        closed = page[page.index("  if (!open) {"):page.index("  bodyFill(body, d, p);")]
+        self.assertEqual(closed.count("serviceEl(d.service)"), 1)
+        self.assertLess(closed.index("serviceEl(d.service)"),
+                        closed.index("rowEl(d.summary)"))
+        # The view carries a service segment only when status is abnormal.
+        norm = llm_usage.normalize_provider_status
+        healthy = {"provider": "antigravity", "status": norm("antigravity", []),
+                   "stale": False, "error": None, "age": None}
+        self.assertIsNone(llm_usage.service_status_segment(healthy))
 
 
 if __name__ == "__main__":

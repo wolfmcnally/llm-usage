@@ -1128,6 +1128,51 @@ def usage_row(label: str, utilization: float, window_seconds: float | None,
     }
 
 
+# A projection from less of the window than this is too noisy to rank by.
+SUMMARY_MIN_ELAPSED_PCT = 5.0
+
+
+def summary_row(rows: list[dict]) -> dict | None:
+    """The single bar a collapsed provider card shows.
+
+    Picks the quota row most likely to run out before it resets. Each row
+    is scored by its usage projected to the end of its window at the pace
+    so far (usage / elapsed share), or by its current usage when the
+    window's elapsed share is unknown or under SUMMARY_MIN_ELAPSED_PCT.
+    Ties go to higher current usage, then the sooner reset, then display
+    order. Headings and rows without a numeric usage are never chosen.
+    The chosen row keeps its group heading in its label.
+    """
+    best = None
+    heading = None
+    for index, item in enumerate(rows):
+        if item.get("type") == "heading":
+            heading = item.get("text")
+            continue
+        if item.get("type") != "row":
+            continue
+        util = _real_number(item.get("utilization"))
+        if util is None:
+            continue
+        now = _real_number(item.get("now_pct"))
+        paced = now is not None and now >= SUMMARY_MIN_ELAPSED_PCT
+        score = util * 100 / now if paced else util
+        reset = _real_number(item.get("reset_seconds"))
+        key = (-score, -util, reset if reset is not None else float("inf"),
+               index)
+        if best is None or key < best[0]:
+            best = (key, heading, item, paced, score)
+    if best is None:
+        return None
+    _, heading, item, paced, score = best
+    summary = dict(item)
+    if heading:
+        summary["label"] = f"{heading} · {item['label']}"
+    summary["basis"] = "projected" if paced else "current"
+    summary["score"] = round(score, 1)
+    return summary
+
+
 def row_layout_widths(rows: list[dict], width: int) -> tuple[int, int]:
     """Shared (label, percent) column widths for a section's view rows."""
     pct_w = max((len(f"{r['utilization']:.0f}%") for r in rows), default=3)
@@ -2533,6 +2578,7 @@ def provider_view(provider: str, snapshot: dict) -> dict:
         "extras": [],
         "advice": [],
         "rows": [],
+        "summary": None,
     }
     tok = snapshot.get("token")
     if not tok or not tok.get("access_token"):
@@ -2568,6 +2614,7 @@ def provider_view(provider: str, snapshot: dict) -> dict:
                 "windows": {},
                 "rate_limited": code == 429,
                 "oauth_expires_at_ms": tok.get("expires_at_ms")}
+    display["summary"] = summary_row(display["rows"])
     view.update({"cached": age is not None, "cache_age_seconds": age,
                  "service_status": service_status, "display": display})
     return view
@@ -2759,7 +2806,7 @@ def antigravity_view(snapshot: dict) -> dict:
         # surface, so the header says so instead of guessing one.
         "title": "GOOGLE ANTIGRAVITY", "plan": "Tier unavailable",
         "notices": [], "service": None, "error": None, "alerts": [],
-        "extras": [], "advice": [], "rows": [],
+        "extras": [], "advice": [], "rows": [], "summary": None,
     }
     display["service"] = service_status_segment(
         snapshot.get("service_status"))
@@ -2805,6 +2852,7 @@ def antigravity_view(snapshot: dict) -> dict:
     # Like agy's own status line, show AI credits only when there are some.
     if balance is not None and balance > 0:
         display["extras"] = [[seg(f"{balance:g} AI credits", "good")]]
+    display["summary"] = summary_row(display["rows"])
     return view
 
 
@@ -2884,6 +2932,14 @@ main{display:grid;gap:18px;
 .card-head{display:flex;justify-content:space-between;align-items:baseline;
   gap:6px 12px;flex-wrap:wrap;padding-bottom:10px;
   border-bottom:1px solid var(--hairline);margin-bottom:4px}
+.p-title{display:flex;align-items:baseline;flex-wrap:wrap;gap:4px 0}
+.disc{appearance:none;background:none;border:0;padding:6px 8px 6px 6px;
+  margin:-6px 1px -6px -6px;
+  font:inherit;font-size:12px;line-height:1;color:var(--ink2);cursor:pointer;
+  border-radius:4px;align-self:center}
+.disc:hover{color:var(--ink)}
+.disc:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
+.disc-icon{display:inline-block;width:1ch;text-align:center}
 .p-name{font-size:12px;font-weight:700;letter-spacing:.16em}
 .p-plan{color:var(--ink2);font-size:12px;margin-left:8px}
 .head-notes{display:flex;gap:4px 12px;flex-wrap:wrap;font-size:11.5px}
@@ -3094,19 +3150,84 @@ function serviceEl(s) {
   return line;
 }
 
-function card(name, p) {
+// Provider cards a viewer has closed. The page redraws each second and polls
+// each minute, and this map carries the choice across both. It is also saved
+// in this browser's localStorage (only {provider id: true} for closed cards)
+// so a reload restores it. Missing, invalid or unknown entries mean open,
+// and without storage the choice still lasts for the page.
+const DISCLOSURE_KEY = "llm-usage.collapsed";
+const PROVIDER_IDS = ["anthropic", "openai", "antigravity"];
+const collapsed = loadCollapsed();
+
+function loadCollapsed() {
+  const state = {};
+  try {
+    const saved = JSON.parse(window.localStorage.getItem(DISCLOSURE_KEY));
+    if (saved && typeof saved === "object" && !Array.isArray(saved)) {
+      for (const id of PROVIDER_IDS) {
+        if (saved[id] === true) state[id] = true;
+      }
+    }
+  } catch (e) { /* no storage or bad JSON: every card opens */ }
+  return state;
+}
+
+function saveCollapsed() {
+  const closed = {};
+  for (const id of PROVIDER_IDS) if (collapsed[id]) closed[id] = true;
+  try {
+    window.localStorage.setItem(DISCLOSURE_KEY, JSON.stringify(closed));
+  } catch (e) { /* storage unavailable: keep the in-page state only */ }
+}
+
+function discEl(key, title, open) {
+  const icon = h("span", "disc-icon", open ? "\u25be" : "\u25b8");
+  icon.setAttribute("aria-hidden", "true");
+  const btn = h("button", "disc", icon);
+  btn.type = "button";
+  btn.dataset.disc = key;
+  btn.setAttribute("aria-expanded", open ? "true" : "false");
+  btn.setAttribute("aria-controls", "details-" + key);
+  btn.setAttribute("aria-label", title + " details");
+  btn.addEventListener("click", () => {
+    collapsed[key] = open;
+    saveCollapsed();
+    render();
+  });
+  return btn;
+}
+
+function card(key, name, p) {
   // A payload without a view (collection failed) still renders its error.
   const d = p.display || {title: name, plan: "", notices: [], service: null,
-    error: p.error || "unavailable", alerts: [], extras: [], rows: []};
-  const nameEl = h("div", null, h("span", "p-name", d.title));
+    error: p.error || "unavailable", alerts: [], extras: [], rows: [],
+    summary: null};
+  const open = !collapsed[key];
+  const nameEl = h("div", "p-title", discEl(key, d.title, open),
+    h("span", "p-name", d.title));
   if (d.plan) nameEl.appendChild(h("span", "p-plan", d.plan));
-  const c = h("section", "card",
-    h("div", "card-head", nameEl,
-      h("div", "head-notes", ...d.notices.map(segEl))));
+  const head = h("div", "card-head", nameEl,
+    h("div", "head-notes", ...d.notices.map(segEl)));
+  const body = h("div", "card-body");
+  body.id = "details-" + key;
+  const c = h("section", "card", head, body);
+  if (!open) {
+    // Closed: the header, the service line only when the view has one (it
+    // is null while service is normal), then the bar summary_row picked.
+    const svc = serviceEl(d.service);
+    if (svc) body.appendChild(svc);
+    if (p.ok && d.summary) body.appendChild(rowEl(d.summary));
+    return c;
+  }
+  bodyFill(body, d, p);
+  return c;
+}
+
+function bodyFill(c, d, p) {
   const svc = serviceEl(d.service);
   if (svc) c.appendChild(svc);
   if (d.error) c.appendChild(h("div", "err", "\\u2716 " + d.error));
-  if (!p.ok) return c;
+  if (!p.ok) return;
   for (const a of d.alerts) c.appendChild(h("div", "alert", segEl(a)));
   let printed = 0;
   for (const it of d.rows) {
@@ -3127,7 +3248,6 @@ function card(name, p) {
     // One inline paragraph that wraps naturally; bullets are in the text.
     c.appendChild(h("p", "advice", ...[].concat(...d.advice).map(segEl)));
   }
-  return c;
 }
 
 function chipEl() {
@@ -3148,11 +3268,22 @@ function chipEl() {
 function render() {
   const missing = {ok: false, error: "missing provider data"};
   const root = document.getElementById("providers");
+  // Redrawing replaces every element, so return keyboard focus to the same
+  // disclosure afterwards.
+  const active = document.activeElement;
+  const focusKey = active && active.dataset ? active.dataset.disc : null;
   root.textContent = "";
-  root.appendChild(card("ANTHROPIC", data.anthropic || missing));
-  root.appendChild(card("OPENAI", data.openai || missing));
+  root.appendChild(card("anthropic", "ANTHROPIC", data.anthropic || missing));
+  root.appendChild(card("openai", "OPENAI", data.openai || missing));
   // Present only where the Antigravity CLI is installed.
-  if (data.antigravity) root.appendChild(card("GOOGLE ANTIGRAVITY", data.antigravity));
+  if (data.antigravity) {
+    root.appendChild(card("antigravity", "GOOGLE ANTIGRAVITY",
+      data.antigravity));
+  }
+  if (focusKey) {
+    const again = root.querySelector('button[data-disc="' + focusKey + '"]');
+    if (again) again.focus({preventScroll: true});
+  }
   chipEl();
 }
 
