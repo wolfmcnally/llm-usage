@@ -2755,7 +2755,9 @@ def antigravity_view(snapshot: dict) -> dict:
     code, body, age = (snapshot.get("code"), snapshot.get("body"),
                        snapshot.get("age"))
     display: dict[str, Any] = {
-        "title": "ANTIGRAVITY", "plan": "Google Antigravity",
+        # agy reports no account tier through a supported read-only
+        # surface, so the header says so instead of guessing one.
+        "title": "GOOGLE ANTIGRAVITY", "plan": "Tier unavailable",
         "notices": [], "service": None, "error": None, "alerts": [],
         "extras": [], "advice": [], "rows": [],
     }
@@ -3150,7 +3152,7 @@ function render() {
   root.appendChild(card("ANTHROPIC", data.anthropic || missing));
   root.appendChild(card("OPENAI", data.openai || missing));
   // Present only where the Antigravity CLI is installed.
-  if (data.antigravity) root.appendChild(card("ANTIGRAVITY", data.antigravity));
+  if (data.antigravity) root.appendChild(card("GOOGLE ANTIGRAVITY", data.antigravity));
   chipEl();
 }
 
