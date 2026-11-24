@@ -20,7 +20,7 @@ OPENAI  ChatGPT Pro Plan                                     Wed Jun 03 13:52 MD
   ...
 ```
 
-The legend and version lead the terminal and TUI output; in the browser dashboard they sit just below the header. In the browser, a triangle at the left of each provider header closes that card down to its header, any degraded or unavailable service status line, and one bar: the quota most likely to run out before it resets, judged by its pace so far, or by current usage when the window has barely started. Each card opens and closes independently, keeps its state while the page refreshes and, through the browser's local storage, across reloads, and works from the keyboard.
+The legend and version lead the terminal and TUI output; in the browser dashboard they sit just below the header. In the browser, clicking a provider's header (it starts with a triangle) closes that card down to its header, any degraded or unavailable service status line, and one bar: the quota most likely to run out before it resets, judged by its pace so far, or by current usage when the window has barely started. Each card opens and closes independently, keeps its state while the page refreshes and, through the browser's local storage, across reloads, and works from the keyboard.
 
 ### Google Antigravity
 

@@ -1794,7 +1794,8 @@ class SummaryRowTests(unittest.TestCase):
 
     def test_page_has_native_disclosure_with_state_and_focus(self):
         page = llm_usage.build_html_page({}, "static")
-        for needle in ('h("button", "disc"', 'btn.type = "button"',
+        self.assertNotIn("discEl(", page)
+        for needle in ('h("button", "card-head disc"', 'btn.type = "button"',
                        '"aria-expanded"', '"aria-controls"',
                        "const collapsed = loadCollapsed();", "collapsed[key] = open;",
                        "again.focus(", ".disc:focus-visible{",

@@ -2934,13 +2934,15 @@ main{display:grid;gap:18px;
   gap:6px 12px;flex-wrap:wrap;padding-bottom:10px;
   border-bottom:1px solid var(--hairline);margin-bottom:4px}
 .p-title{display:flex;align-items:baseline;flex-wrap:wrap;gap:4px 0}
-.disc{appearance:none;background:none;border:0;padding:6px 8px 6px 6px;
-  margin:-6px 1px -6px -6px;
-  font:inherit;font-size:12px;line-height:1;color:var(--ink2);cursor:pointer;
-  border-radius:4px;align-self:center}
-.disc:hover{color:var(--ink)}
-.disc:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
-.disc-icon{display:inline-block;width:1ch;text-align:center}
+/* The whole header is the disclosure button: one control, one focus stop. */
+.disc{appearance:none;width:100%;background:none;border-width:0 0 1px;
+  border-style:solid;border-color:var(--hairline);border-radius:0;
+  font:inherit;color:inherit;text-align:left;cursor:pointer}
+.disc:hover .disc-icon{color:var(--ink)}
+.disc:focus-visible{outline:2px solid var(--ink);outline-offset:4px;
+  border-radius:6px}
+.disc-icon{display:inline-block;width:1ch;text-align:center;
+  margin-right:7px;font-size:12px;color:var(--ink2)}
 .p-name{font-size:12px;font-weight:700;letter-spacing:.16em}
 .p-plan{color:var(--ink2);font-size:12px;margin-left:8px}
 .head-notes{display:flex;gap:4px 12px;flex-wrap:wrap;font-size:11.5px}
@@ -3181,15 +3183,20 @@ function saveCollapsed() {
   } catch (e) { /* storage unavailable: keep the in-page state only */ }
 }
 
-function discEl(key, title, open) {
+// The card header is a single native disclosure button holding the
+// triangle, provider name, plan and header notices (plain text only), so a
+// click anywhere on it toggles the card. Links stay in the card body.
+function headEl(key, d, open) {
   const icon = h("span", "disc-icon", open ? "\u25be" : "\u25b8");
   icon.setAttribute("aria-hidden", "true");
-  const btn = h("button", "disc", icon);
+  const title = h("span", "p-title", icon, h("span", "p-name", d.title));
+  if (d.plan) title.appendChild(h("span", "p-plan", d.plan));
+  const btn = h("button", "card-head disc", title,
+    h("span", "head-notes", ...d.notices.map(segEl)));
   btn.type = "button";
   btn.dataset.disc = key;
   btn.setAttribute("aria-expanded", open ? "true" : "false");
   btn.setAttribute("aria-controls", "details-" + key);
-  btn.setAttribute("aria-label", title + " details");
   btn.addEventListener("click", () => {
     collapsed[key] = open;
     saveCollapsed();
@@ -3204,11 +3211,7 @@ function card(key, name, p) {
     error: p.error || "unavailable", alerts: [], extras: [], rows: [],
     summary: null};
   const open = !collapsed[key];
-  const nameEl = h("div", "p-title", discEl(key, d.title, open),
-    h("span", "p-name", d.title));
-  if (d.plan) nameEl.appendChild(h("span", "p-plan", d.plan));
-  const head = h("div", "card-head", nameEl,
-    h("div", "head-notes", ...d.notices.map(segEl)));
+  const head = headEl(key, d, open);
   const body = h("div", "card-body");
   body.id = "details-" + key;
   const c = h("section", "card", head, body);
