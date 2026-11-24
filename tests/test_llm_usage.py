@@ -1505,5 +1505,218 @@ class FableResetAdviceTests(unittest.TestCase):
         self.assertIn(".advice span{font-size:inherit;", page)
 
 
+ANTIGRAVITY_FIXTURE_PATH = FIXTURES / "antigravity_usage.json"
+AGY_NOW = 1893456000.0  # 2030-01-01T00:00:00Z, before every fixture reset
+
+
+def agy_run(stdout="", returncode=0):
+    return mock.Mock(stdout=stdout, stderr="private stderr", returncode=returncode)
+
+
+def agy_snapshot(code=200, body=None, status=None):
+    if body is None and code == 200:
+        envelope = json.loads(ANTIGRAVITY_FIXTURE_PATH.read_text())
+        body = {"usage": envelope["command"]["data"],
+                "credits": {"remaining_credits": 0}}
+    return {"provider": "antigravity", "code": code, "body": body,
+            "age": None, "loaded_at": AGY_NOW, "deadline": AGY_NOW + 600,
+            "service_status": status}
+
+
+def gemini_incident(impact="SERVICE_DISRUPTION", end=None,
+                    product="Z0FZJAMvEB4j3NbCJs6B", desc="Elevated errors"):
+    return {"id": "fixture", "begin": "2030-01-01T00:00:00+00:00",
+            "end": end, "status_impact": impact, "severity": "medium",
+            "external_desc": desc, "uri": "incidents/fixture",
+            "affected_products": [{"title": "Vertex Gemini API",
+                                   "id": product}]}
+
+
+class AntigravityTests(unittest.TestCase):
+    def test_fetch_keeps_only_command_data(self):
+        envelope = ANTIGRAVITY_FIXTURE_PATH.read_text()
+        credits = json.dumps({"status": "SUCCESS", "command": {
+            "name": "credits", "data": {"remaining_credits": 12,
+                                        "upgrade_uri": "https://x"}}})
+        with mock.patch.object(llm_usage.shutil, "which",
+                               return_value="/bin/agy"), mock.patch.object(
+                llm_usage.subprocess, "run",
+                side_effect=[agy_run(envelope), agy_run(credits)]) as run:
+            code, body = llm_usage.fetch_antigravity()
+        self.assertEqual(code, 200)
+        self.assertEqual(set(body), {"usage", "credits"})
+        self.assertNotIn("fixture-conversation", json.dumps(body))
+        self.assertEqual(run.call_args_list[0].args[0],
+                         ["/bin/agy", "-p", "/usage", "--output-format",
+                          "json"])
+        self.assertEqual(run.call_args_list[1].args[0][2], "/credits")
+
+    def test_fetch_failures_are_not_quota(self):
+        cases = (
+            (agy_run(returncode=2), "api_key"),
+            (agy_run(returncode=1), "agy /usage exited 1"),
+            (agy_run("not json"), "agy /usage returned no quota data"),
+            (agy_run(json.dumps({"status": "ERROR"})),
+             "agy /usage returned no quota data"),
+            (llm_usage.subprocess.TimeoutExpired("agy", 30),
+             "agy /usage timed out or could not run"),
+        )
+        for outcome, error in cases:
+            with self.subTest(error), mock.patch.object(
+                    llm_usage.shutil, "which", return_value="/bin/agy"), \
+                    mock.patch.object(llm_usage.subprocess, "run",
+                                      side_effect=[outcome]):
+                code, body = llm_usage.fetch_antigravity()
+            self.assertIsNone(code)
+            self.assertEqual(body, {"error": error})
+            self.assertNotIn("private stderr", json.dumps(body))
+
+    def test_absent_cli_leaves_the_section_out(self):
+        with mock.patch.object(llm_usage.shutil, "which", return_value=None):
+            self.assertIsNone(llm_usage.antigravity_snapshot())
+            snapshot = {"anthropic": {}, "openai": {}}
+            with mock.patch.object(llm_usage, "anthropic_snapshot",
+                                   return_value=agy_snapshot(None, {})), \
+                    mock.patch.object(llm_usage, "openai_snapshot",
+                                      return_value=agy_snapshot(None, {})), \
+                    mock.patch.object(llm_usage, "provider_status_snapshot",
+                                      return_value={"deadline": 1.0}) as st:
+                snapshot = llm_usage.load_dashboard_snapshot()
+        self.assertIsNone(snapshot["antigravity"])
+        self.assertNotIn(mock.call("antigravity"), st.call_args_list)
+
+    def test_pools_render_weekly_first_and_unreadable_is_not_zero(self):
+        with mock.patch.object(llm_usage.time, "time", return_value=AGY_NOW):
+            view = llm_usage.antigravity_view(agy_snapshot())
+        self.assertTrue(view["ok"])
+        rows = view["display"]["rows"]
+        self.assertEqual(
+            [(r.get("text") or r["label"], r.get("utilization"))
+             for r in rows],
+            [("Fixture Models", None), ("7-day", 25.0), ("5-hour", 60.0),
+             ("Partner Models", None), ("7-day", 0.0)])
+        self.assertEqual(rows[1]["window_seconds"], 7 * 86400)
+        self.assertEqual(view["display"]["alerts"][0]["text"],
+                         "1 quota pool reported no readable value")
+        partner = view["groups"][1]["buckets"][1]
+        self.assertIsNone(partner["utilization"])
+        self.assertEqual(view["display"]["extras"], [])
+        json.dumps(view)
+
+    def test_credits_show_only_when_positive(self):
+        snap = agy_snapshot()
+        snap["body"]["credits"] = {"remaining_credits": 1500}
+        view = llm_usage.antigravity_view(snap)
+        self.assertEqual(view["display"]["extras"][0][0]["text"],
+                         "1500 AI credits")
+
+    def test_error_views(self):
+        api = llm_usage.antigravity_view(agy_snapshot(None,
+                                                      {"error": "api_key"}))
+        self.assertFalse(api["ok"])
+        self.assertIn("API key", api["display"]["error"])
+        failed = llm_usage.antigravity_view(
+            agy_snapshot(None, {"error": "agy /usage exited 1"}))
+        self.assertEqual(failed["display"]["error"],
+                         "agy /usage exited 1; run `agy` to sign in")
+        lines, ok = llm_usage.render_provider_section(failed, 100)
+        self.assertFalse(ok)
+
+    def test_gemini_status_healthy_degraded_outage_and_scope(self):
+        norm = llm_usage.normalize_provider_status
+        healthy = norm("antigravity", [
+            gemini_incident(end="2030-01-01T01:00:00+00:00"),
+            gemini_incident(product="other-product")])
+        self.assertTrue(healthy["operational"])
+        self.assertEqual(healthy["description"],
+                         "Gemini on Google Cloud: no active incidents")
+        degraded = norm("antigravity", [gemini_incident()])
+        self.assertEqual((degraded["indicator"], degraded["operational"]),
+                         ("minor", False))
+        self.assertEqual(degraded["description"],
+                         "Gemini on Google Cloud: Elevated errors")
+        outage = norm("antigravity", [
+            gemini_incident(), gemini_incident("SERVICE_OUTAGE",
+                                               desc="Gemini API down")])
+        self.assertEqual(outage["indicator"], "major")
+        self.assertEqual(outage["description"],
+                         "Gemini on Google Cloud: Gemini API down (+1 more)")
+        self.assertIsNone(norm("antigravity", {"status": {}}))
+
+    def test_status_segment_links_and_unavailable_is_not_healthy(self):
+        def snap(status, error=None):
+            return {"provider": "antigravity", "status": status,
+                    "stale": False, "error": error, "age": None}
+        link = llm_usage.STATUS_PAGE_URLS["antigravity"]
+        norm = llm_usage.normalize_provider_status
+        self.assertIsNone(llm_usage.service_status_segment(
+            snap(norm("antigravity", []))))
+        outage = llm_usage.service_status_segment(snap(norm(
+            "antigravity", [gemini_incident("SERVICE_OUTAGE")])))
+        self.assertEqual((outage["tone"], outage["link"]), ("critical", link))
+        self.assertEqual(outage["text"],
+                         "● Service status: Gemini on Google Cloud: "
+                         "Elevated errors")
+        unavailable = llm_usage.service_status_segment(
+            snap(None, "network error"))
+        self.assertEqual(unavailable["text"],
+                         "? Service status unavailable (network error)")
+        self.assertEqual(unavailable["tone"], "warn")
+        status_json = llm_usage.provider_status_json(
+            snap(None, "network error"))
+        self.assertFalse(status_json["available"])
+        self.assertIsNone(status_json["operational"])
+        view = llm_usage.antigravity_view(agy_snapshot(
+            status=snap(None, "network error")))
+        self.assertEqual(view["display"]["service"]["text"],
+                         "? Service status unavailable (network error)")
+
+    def test_google_feed_polls_at_most_every_five_minutes(self):
+        with mock.patch.dict(llm_usage.os.environ, {}, clear=True), \
+                mock.patch.object(llm_usage, "_read_cache_document",
+                                  return_value={"ts": 1000.0, "body": []}), \
+                mock.patch.object(llm_usage.time, "time",
+                                  return_value=1200.0), \
+                mock.patch.object(llm_usage,
+                                  "http_get_json_response") as get:
+            result = llm_usage.provider_status_snapshot("antigravity")
+        get.assert_not_called()
+        self.assertTrue(result["status"]["operational"])
+        self.assertEqual(result["deadline"], 1300.0)
+
+
+class LegendPlacementTests(unittest.TestCase):
+    def snapshot(self, with_agy):
+        down = {"token": None, "code": None, "body": None, "age": None,
+                "loaded_at": 1000.0, "service_status": None}
+        return {"anthropic": dict(down), "openai": dict(down),
+                "antigravity": agy_snapshot() if with_agy else None,
+                "deadline": 1060.0}
+
+    def test_terminal_legend_and_version_lead_and_agy_section_is_optional(self):
+        with mock.patch.object(llm_usage.time, "time", return_value=AGY_NOW):
+            lines, code = llm_usage.render_dashboard_snapshot(
+                self.snapshot(True), 100, True)
+            without, _ = llm_usage.render_dashboard_snapshot(
+                self.snapshot(False), 100, True)
+        plain = [llm_usage.ANSI_RE.sub("", line) for line in lines]
+        self.assertTrue(plain[0].startswith("Used:"))
+        self.assertTrue(plain[0].endswith(f"v{llm_usage.__version__}"))
+        self.assertTrue(any(line.startswith("ANTIGRAVITY") for line in plain))
+        self.assertFalse(any("ANTIGRAVITY" in line for line in without))
+        self.assertFalse(any(line.startswith("Used:")
+                             for line in plain[1:]))
+        self.assertEqual(code, 2)  # unchanged: Claude and OpenAI only
+
+    def test_html_legend_sits_under_the_header(self):
+        page = llm_usage.build_html_page({}, "static")
+        header_end = page.index("</header>")
+        self.assertLess(header_end, page.index('<div class="legend">'))
+        self.assertLess(page.index('<div class="legend">'),
+                        page.index('<main id="providers"'))
+        self.assertNotIn("<footer>", page)
+        self.assertIn('card("ANTIGRAVITY", data.antigravity)', page)
+
+
 if __name__ == "__main__":
     unittest.main()

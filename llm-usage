@@ -640,7 +640,7 @@ def usage_valid_until(provider: str, body: Any, fetched_at: float
     lapses, the cached counts are wrong, so the cache entry and the data
     refresh deadline both end there.
     """
-    if not isinstance(body, dict):
+    if not isinstance(body, dict) or provider == "antigravity":
         return None
     if provider == "openai":
         return openai_next_reset_credit_expiry(body, require_future=False)
@@ -689,11 +689,30 @@ def cache_notice(code: int | None, age: float | None) -> dict | None:
 STATUS_URLS = {
     "anthropic": "https://status.claude.com/api/v2/summary.json",
     "openai": "https://status.openai.com/api/v2/summary.json",
+    # Google Cloud Service Health's documented public incident feed. Google
+    # AI Studio's Gemini API status page has no public feed, so Antigravity's
+    # status line reports only the Gemini product Google Cloud tracks.
+    "antigravity": "https://status.cloud.google.com/incidents.json",
 }
 
 STATUS_PAGE_URLS = {
     "anthropic": "https://status.claude.com/",
     "openai": "https://status.openai.com/",
+    "antigravity": ("https://status.cloud.google.com/products/"
+                    "Z0FZJAMvEB4j3NbCJs6B/history"),
+}
+
+# Stable Service Health product id (display names may change) for "Vertex
+# Gemini API", shown on the dashboard as "Gemini on Agent Platform".
+GEMINI_CLOUD_PRODUCT_ID = "Z0FZJAMvEB4j3NbCJs6B"
+GEMINI_STATUS_LABEL = "Gemini on Google Cloud"
+# The Google feed lists every product's incidents (~300 KB), so poll it at
+# most every five minutes even though the other feeds allow one minute.
+MIN_GOOGLE_STATUS_TTL = 300
+GOOGLE_IMPACT_INDICATORS = {
+    "SERVICE_OUTAGE": "major",
+    "SERVICE_DISRUPTION": "minor",
+    "SERVICE_INFORMATION": "maintenance",
 }
 
 
@@ -758,8 +777,53 @@ def _status_retry_seconds(failures: int, retry_after: str | None,
     return max(1.0, base * random.uniform(0.9, 1.1))
 
 
+def normalize_gemini_cloud_status(body: Any) -> dict | None:
+    """Active Google Cloud incidents for the Gemini product, normalized like
+    a Statuspage summary. The feed covers Gemini on Google Cloud only, so the
+    description says so rather than speaking for all of Antigravity."""
+    if not isinstance(body, list):
+        return None
+    active = []
+    for incident in body:
+        if not isinstance(incident, dict) or incident.get("end"):
+            continue
+        products = incident.get("affected_products") or []
+        if any(isinstance(product, dict)
+               and product.get("id") == GEMINI_CLOUD_PRODUCT_ID
+               for product in products):
+            active.append(incident)
+    if not active:
+        return {"provider": "antigravity", "indicator": "none",
+                "description": f"{GEMINI_STATUS_LABEL}: no active incidents",
+                "operational": True, "affected_components": []}
+    rank = {"major": 3, "minor": 2, "maintenance": 1}
+    worst_indicator, worst = "none", active[0]
+    for incident in active:
+        indicator = GOOGLE_IMPACT_INDICATORS.get(
+            str(incident.get("status_impact") or ""), "minor")
+        if rank[indicator] > rank.get(worst_indicator, 0):
+            worst_indicator, worst = indicator, incident
+    summary = " ".join(str(worst.get("external_desc")
+                           or "service incident").split())
+    if len(summary) > 120:
+        summary = summary[:117].rstrip() + "…"
+    more = f" (+{len(active) - 1} more)" if len(active) > 1 else ""
+    return {
+        "provider": "antigravity",
+        "indicator": worst_indicator,
+        "description": f"{GEMINI_STATUS_LABEL}: {summary}{more}",
+        "operational": False,
+        "affected_components": [
+            {"name": " ".join(str(i.get("external_desc") or "").split())[:120],
+             "status": str(i.get("status_impact") or "unknown").lower()}
+            for i in active],
+    }
+
+
 def normalize_provider_status(provider: str, body: Any) -> dict | None:
     """Normalize the shared Statuspage-style summary response."""
+    if provider == "antigravity":
+        return normalize_gemini_cloud_status(body)
     if not isinstance(body, dict):
         return None
     raw_status = body.get("status")
@@ -808,6 +872,8 @@ def provider_status_snapshot(provider: str) -> dict:
     loaded_at = time.time()
     cache_key = f"status-{provider}"
     ttl = status_ttl()
+    if provider == "antigravity" and ttl > 0:
+        ttl = max(ttl, MIN_GOOGLE_STATUS_TTL)
     cached = (_read_cache_document(cache_key) if ttl > 0 else None) or {}
     cached_body = cached.get("body")
     cached_ts = cached.get("ts")
@@ -2562,8 +2628,182 @@ def emit_json() -> int:
     snapshot = load_dashboard_snapshot()
     a = provider_view("anthropic", snapshot["anthropic"])
     o = provider_view("openai", snapshot["openai"])
-    print(json.dumps({"anthropic": a, "openai": o}, indent=2))
+    payload = {"anthropic": a, "openai": o}
+    # Antigravity appears only where `agy` is installed, and stays outside
+    # the documented 0/1/2 exit code, which covers the two subscriptions.
+    if snapshot.get("antigravity") is not None:
+        payload["antigravity"] = antigravity_view(snapshot["antigravity"])
+    print(json.dumps(payload, indent=2))
     return dashboard_exit_code(a["ok"], o["ok"])
+
+
+# ---------------------------------------------------------- antigravity ----
+#
+# Google Antigravity CLI (`agy`) quota pools. The only input is the CLI's own
+# documented print-mode answer to the read-only `/usage` and `/credits` slash
+# commands under `--output-format json`, which per the CLI changelog runs
+# "without starting an agent turn, spending quota, or leaving a conversation
+# behind". The section appears only where `agy` is on PATH; this tool never
+# reads Antigravity credentials or calls its backend itself.
+
+AGY_TIMEOUT_SECONDS = 30
+AGY_WINDOWS = {"5h": ("5-hour", 5 * 3600), "weekly": ("7-day", 7 * 86400)}
+
+
+def _agy_command(exe: str, command: str) -> tuple[int | None, Any]:
+    """Run one read-only print-mode slash command; never raises.
+
+    Returns (exit_code, command data) — data is the payload's
+    `command.data` object, or None when the output is unusable. Nothing
+    else from the envelope (conversation id, response text) is kept.
+    """
+    try:
+        proc = subprocess.run(
+            [exe, "-p", f"/{command}", "--output-format", "json"],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            timeout=AGY_TIMEOUT_SECONDS)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None, None
+    if proc.returncode != 0:
+        return proc.returncode, None
+    try:
+        payload = json.loads(proc.stdout)
+    except ValueError:
+        return 0, None
+    if not isinstance(payload, dict) or payload.get("status") != "SUCCESS":
+        return 0, None
+    data = (payload.get("command") or {}).get("data")
+    return 0, data if isinstance(data, dict) else None
+
+
+def fetch_antigravity(_tok: Any = None) -> tuple[int | None, Any]:
+    """Quota pools plus AI-credit balance, shaped like an HTTP result.
+
+    200 with {"usage", "credits"} on success. Exit code 2 is the CLI's
+    documented answer for a GEMINI_API_KEY login, which has no account
+    quota; any other failure is reported without its output, which may
+    name the account.
+    """
+    exe = shutil.which("agy")
+    if not exe:
+        return None, {"error": "agy not installed"}
+    code, usage = _agy_command(exe, "usage")
+    if code == 2:
+        return None, {"error": "api_key"}
+    if usage is None:
+        reason = ("timed out or could not run" if code is None
+                  else f"exited {code}" if code else "returned no quota data")
+        return None, {"error": f"agy /usage {reason}"}
+    _, credits = _agy_command(exe, "credits")
+    return 200, {"usage": usage, "credits": credits}
+
+
+def antigravity_snapshot() -> dict | None:
+    """None where `agy` is not installed, so the section is left out."""
+    if not shutil.which("agy"):
+        return None
+    loaded_at = time.time()
+    code, body, age = cached_fetch("antigravity", fetch_antigravity, {})
+    return {"provider": "antigravity", "code": code, "body": body,
+            "age": age, "loaded_at": loaded_at,
+            "deadline": next_data_refresh_deadline(
+                code, age, loaded_at, "antigravity", body)}
+
+
+def antigravity_pools(body: dict, now: float | None = None) -> list[dict]:
+    """Normalized pool groups; a bucket without a valid remaining fraction
+    is marked unreadable rather than shown as 0% or 100% used."""
+    if now is None:
+        now = time.time()
+    usage = body.get("usage") if isinstance(body, dict) else None
+    groups = []
+    for group in (usage or {}).get("groups") or []:
+        if not isinstance(group, dict):
+            continue
+        buckets = []
+        for bucket in group.get("buckets") or []:
+            if not isinstance(bucket, dict):
+                continue
+            remaining = _real_number(bucket.get("remaining_fraction"))
+            window = str(bucket.get("window") or "")
+            label, window_seconds = AGY_WINDOWS.get(
+                window, (window or str(bucket.get("name") or "limit"), None))
+            reset = _aware_epoch(bucket.get("reset_time"))
+            valid = remaining is not None and 0 <= remaining <= 1
+            buckets.append({
+                "id": bucket.get("id"),
+                "name": bucket.get("name"),
+                "window": window,
+                "label": label,
+                "window_seconds": window_seconds,
+                "remaining_fraction": remaining if valid else None,
+                "utilization": round((1 - remaining) * 100, 1)
+                if valid else None,
+                "reset_time": bucket.get("reset_time"),
+                "reset_seconds": reset - now if reset is not None else None,
+            })
+        # Weekly first, like the other providers.
+        buckets.sort(key=lambda b: 0 if b["window"] == "weekly" else 1)
+        groups.append({"name": str(group.get("name") or "Models"),
+                       "description": group.get("description"),
+                       "buckets": buckets})
+    return groups
+
+
+def antigravity_view(snapshot: dict) -> dict:
+    """Provider view for Antigravity, in the same shape as provider_view."""
+    code, body, age = (snapshot.get("code"), snapshot.get("body"),
+                       snapshot.get("age"))
+    display: dict[str, Any] = {
+        "title": "ANTIGRAVITY", "plan": "Google Antigravity",
+        "notices": [], "service": None, "error": None, "alerts": [],
+        "extras": [], "advice": [], "rows": [],
+    }
+    display["service"] = service_status_segment(
+        snapshot.get("service_status"))
+    view: dict[str, Any] = {"ok": False, "error": None, "groups": [],
+                            "credits": None,
+                            "cached": age is not None,
+                            "cache_age_seconds": age,
+                            "service_status": provider_status_json(
+                                snapshot.get("service_status")),
+                            "display": display}
+    status = cache_notice(code, displayed_cache_age(snapshot))
+    display["notices"] = [status] if status else []
+    if code != 200 or not isinstance(body, dict):
+        error = (body or {}).get("error") if isinstance(body, dict) else None
+        if error == "api_key":
+            display["error"] = ("signed in with an API key, which has no "
+                                "account quota; see its usage in AI Studio")
+        else:
+            display["error"] = (f"{error or 'quota unavailable'}; "
+                                "run `agy` to sign in")
+        view["error"] = error or "quota unavailable"
+        return view
+    groups = antigravity_pools(body)
+    credits = body.get("credits") or {}
+    balance = _real_number(credits.get("remaining_credits"))
+    view.update(ok=True, groups=groups,
+                credits={"remaining": balance} if balance is not None
+                else None)
+    unreadable = 0
+    for group in groups:
+        rows = [usage_row(b["label"], b["utilization"], b["window_seconds"],
+                          b["reset_seconds"])
+                for b in group["buckets"] if b["utilization"] is not None]
+        unreadable += sum(b["utilization"] is None for b in group["buckets"])
+        if rows:
+            display["rows"].append({"type": "heading", "text": group["name"],
+                                    "badges": []})
+            display["rows"].extend(rows)
+    if unreadable:
+        display["alerts"].append(seg(
+            f"{unreadable} quota pool{'s' if unreadable != 1 else ''} "
+            "reported no readable value", "warn"))
+    # Like agy's own status line, show AI credits only when there are some.
+    if balance is not None and balance > 0:
+        display["extras"] = [[seg(f"{balance:g} AI credits", "good")]]
+    return view
 
 
 # ------------------------------------------------------------ html output ----
@@ -2689,9 +2929,8 @@ main{display:grid;gap:18px;
 .x-label{color:var(--muted)}
 .advice{margin:8px 0 0;font-size:12px;line-height:1.45;color:var(--ink2)}
 .advice span{font-size:inherit;font-weight:inherit}
-footer{margin-top:28px;color:var(--muted);font-size:12px;
-  display:flex;flex-direction:column;gap:9px}
-.legend{display:flex;gap:6px 16px;flex-wrap:wrap}
+.legend{display:flex;gap:6px 16px;flex-wrap:wrap;color:var(--muted);
+  font-size:12px;margin:-8px 0 18px}
 .version{margin-left:auto;white-space:nowrap}
 .lg{display:inline-flex;gap:7px;align-items:center;white-space:nowrap}
 .sw{width:13px;height:9px;border-radius:2px;display:inline-block;flex:none}
@@ -2712,16 +2951,14 @@ footer{margin-top:28px;color:var(--muted);font-size:12px;
     </div>
     <span id="mode-chip" class="chip"></span>
   </header>
+  <div class="legend">
+    <span class="lg"><i class="sw" style="background:var(--good)"></i>&lt;50% used</span>
+    <span class="lg"><i class="sw" style="background:var(--warning)"></i>&ge;50%</span>
+    <span class="lg"><i class="sw" style="background:var(--serious)"></i>&ge;75%</span>
+    <span class="lg"><i class="sw" style="background:var(--critical)"></i>&ge;90%</span>
+    <span class="version">v__VERSION__</span>
+  </div>
   <main id="providers" aria-live="polite"></main>
-  <footer>
-    <div class="legend">
-      <span class="lg"><i class="sw" style="background:var(--good)"></i>&lt;50% used</span>
-      <span class="lg"><i class="sw" style="background:var(--warning)"></i>&ge;50%</span>
-      <span class="lg"><i class="sw" style="background:var(--serious)"></i>&ge;75%</span>
-      <span class="lg"><i class="sw" style="background:var(--critical)"></i>&ge;90%</span>
-      <span class="version">v__VERSION__</span>
-    </div>
-  </footer>
 </div>
 <script id="payload" type="application/json">__PAYLOAD_JSON__</script>
 <script>
@@ -2912,6 +3149,8 @@ function render() {
   root.textContent = "";
   root.appendChild(card("ANTHROPIC", data.anthropic || missing));
   root.appendChild(card("OPENAI", data.openai || missing));
+  // Present only where the Antigravity CLI is installed.
+  if (data.antigravity) root.appendChild(card("ANTIGRAVITY", data.antigravity));
   chipEl();
 }
 
@@ -3072,26 +3311,33 @@ def run_html_server(fresh: bool, port: int = DEFAULT_HTML_PORT) -> int:
 # ------------------------------------------------------------ dashboard ----
 
 def load_dashboard_snapshot() -> dict:
-    # The four loads are independent (separate hosts, separate cache files,
+    # The loads are independent (separate hosts, separate cache files,
     # fetchers never raise), so run them concurrently: a cold refresh costs
-    # the slowest request instead of the sum of all four.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+    # the slowest request instead of the sum of all of them.
+    # Antigravity (quota and Gemini status) loads only where `agy` exists.
+    agy_installed = shutil.which("agy") is not None
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
         futures = [
             pool.submit(provider_status_snapshot, "anthropic"),
             pool.submit(provider_status_snapshot, "openai"),
             pool.submit(anthropic_snapshot),
             pool.submit(openai_snapshot),
         ]
-        anthropic_status, openai_status, a, o = (f.result() for f in futures)
+        if agy_installed:
+            futures += [pool.submit(antigravity_snapshot),
+                        pool.submit(provider_status_snapshot, "antigravity")]
+        results = [f.result() for f in futures]
+    anthropic_status, openai_status, a, o = results[:4]
+    g = results[4] if agy_installed else None
     a["service_status"] = anthropic_status
     o["service_status"] = openai_status
-    deadline = min(
-        float(a["deadline"]),
-        float(o["deadline"]),
-        float(anthropic_status["deadline"]),
-        float(openai_status["deadline"]),
-    )
-    return {"anthropic": a, "openai": o, "deadline": deadline}
+    deadlines = [a["deadline"], o["deadline"], anthropic_status["deadline"],
+                 openai_status["deadline"]]
+    if g is not None:
+        g["service_status"] = results[5]
+        deadlines += [g["deadline"], results[5]["deadline"]]
+    return {"anthropic": a, "openai": o, "antigravity": g,
+            "deadline": min(float(d) for d in deadlines)}
 
 
 def display_width(columns: int, clamp: bool) -> int:
@@ -3125,16 +3371,20 @@ def legend_line(width: int) -> str:
 def render_dashboard_snapshot(snapshot: dict, columns: int,
                               clamp_width: bool) -> tuple[list[str], int]:
     width = display_width(columns, clamp_width)
-    lines = []
+    separator = ["", RULE_FG + "═" * width + RESET, ""]
+    lines = [legend_line(width), ""]
     a_lines, a_ok = render_provider_section(
         provider_view("anthropic", snapshot["anthropic"]), width)
     lines.extend(a_lines)
-    lines.extend(["", RULE_FG + "═" * width + RESET, ""])
+    lines.extend(separator)
     o_lines, o_ok = render_provider_section(
         provider_view("openai", snapshot["openai"]), width)
     lines.extend(o_lines)
-    lines.append("")
-    lines.append(legend_line(width))
+    if snapshot.get("antigravity") is not None:
+        g_lines, _ = render_provider_section(
+            antigravity_view(snapshot["antigravity"]), width)
+        lines.extend(separator)
+        lines.extend(g_lines)
     lines.append("")
     return [clip_ansi(line, width) for line in lines], dashboard_exit_code(a_ok, o_ok)
 

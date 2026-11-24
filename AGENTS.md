@@ -91,8 +91,9 @@ Overrides:
 
 Writes are atomic (`os.replace` of a pid-suffixed temp file) and entirely best-effort — cache I/O errors never break a render. Both the TUI and `--json` paths funnel through `cached_fetch`.
 
-Public status monitoring uses separate `status-{anthropic,openai}.json` cache
-documents and a 60-second default TTL (`LLM_USAGE_STATUS_TTL`). Refresh failures
+Public status monitoring uses separate `status-{anthropic,openai,antigravity}.json` cache
+documents and a 60-second default TTL (`LLM_USAGE_STATUS_TTL`); the Google feed
+(`status.cloud.google.com/incidents.json`, ~300 KB) is polled at most every 5 minutes. Refresh failures
 preserve the last successful body and establish a persistent jittered backoff:
 5 minutes, 15 minutes, then 1 hour. `Retry-After` takes precedence, and
 Anthropic `ETag` values are sent back as `If-None-Match`. Never turn a failed
@@ -125,5 +126,7 @@ snapshot on every repaint so clocks stay current. Preserve that boundary for TUI
 resize, scroll, and 60-second repaint behavior. The four loads in
 `load_dashboard_snapshot` (two status feeds, two usage snapshots) run
 concurrently; they share no mutable state beyond separate cache files.
+
+**Google Antigravity** (optional third section, `antigravity_snapshot` / `antigravity_view`): present only when `agy` is on `PATH` (`load_dashboard_snapshot` skips both its loads otherwise, and `--json` omits the key). Its only input is the CLI's documented read-only print-mode `agy -p "/usage"` and `agy -p "/credits"` with `--output-format json` (no agent turn, no quota spent); `fetch_antigravity` keeps only `command.data`, never stderr or the conversation id, and never reads Antigravity credentials. Exit code 2 means a `GEMINI_API_KEY` login with no account quota. Buckets carry `remaining_fraction` (0–1) and UTC `reset_time`; a missing or out-of-range fraction is flagged as unreadable, never treated as 0%. It is cached under `antigravity.json` with the generic success TTL and does not change the 0/1/2 exit code. Its status line comes from Google Cloud Service Health's documented public incident feed, filtered by the stable product id `GEMINI_CLOUD_PRODUCT_ID` (Vertex Gemini API, now "Gemini on Agent Platform") and always labelled "Gemini on Google Cloud". Google AI Studio's status page uses a private RPC, so do not scrape it, and do not present this line as Antigravity or Claude/GPT-pool health. The legend and version line is the first terminal/TUI line and sits directly below the HTML header.
 
 The trailing `__main__` block deliberately handles `BrokenPipeError` (exit 141) including the interpreter's exit-time stdout flush — preserve that if touching `main()`.

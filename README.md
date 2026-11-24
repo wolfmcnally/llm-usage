@@ -1,8 +1,10 @@
 # llm-usage
 
-A terminal dashboard for your **Anthropic (Claude)** and **OpenAI (ChatGPT/Codex)** subscription rate limits — the same numbers Claude Code's `/usage` command and the Codex CLI report, side by side, sized to your terminal. Provider-specific usage credits, spending, reset credits, and scoped limit groups are included when the usage endpoints report them.
+A terminal dashboard for your **Anthropic (Claude)** and **OpenAI (ChatGPT/Codex)** subscription rate limits — the same numbers Claude Code's `/usage` command and the Codex CLI report, side by side, sized to your terminal. Provider-specific usage credits, spending, reset credits, and scoped limit groups are included when the usage endpoints report them. Where the Google Antigravity CLI (`agy`) is installed, a third section shows its quota pools.
 
 ```text
+Used: █ ok  █ 50%  █ 75%  █ 90%                                           v0.2.0
+
 ANTHROPIC  Claude Max Plan  [⚠ OAuth expires in 3h 19m]      Wed Jun 03 13:51 MDT
 ──────────────────────────────────────────────────────────────────────────────────
   ● Service status: Partial System Outage
@@ -16,10 +18,13 @@ ANTHROPIC  Claude Max Plan  [⚠ OAuth expires in 3h 19m]      Wed Jun 03 13:51 
 OPENAI  ChatGPT Pro Plan                                     Wed Jun 03 13:52 MDT
 ──────────────────────────────────────────────────────────────────────────────────
   ...
-
-Used: █ ok  █ 50%  █ 75%  █ 90%
-Pace: ▼ under  ▼ on  ▼ over
 ```
+
+The legend and version lead the terminal and TUI output; in the browser dashboard they sit just below the header.
+
+### Google Antigravity
+
+When `agy` is on `PATH`, an `ANTIGRAVITY` section lists each quota group the CLI reports (for example Gemini models, and Claude and GPT models) with its weekly and 5-hour pools, plus the AI credit balance when it is above zero. The data comes only from the CLI's own read-only print-mode answers, `agy -p "/usage"` and `agy -p "/credits"` with `--output-format json`, which start no agent turn and spend no quota; llm-usage never reads Antigravity credentials. A login with a `GEMINI_API_KEY` has no account quota, and a signed-out CLI shows an inline error. A pool without a readable value is flagged rather than shown as 0% or 100%. Its status line reports active Google Cloud Service Health incidents for Gemini on Google Cloud ("Gemini on Agent Platform") and links to that product's status page. That feed does not cover Antigravity itself or its Claude and GPT pools, and Google AI Studio's Gemini API status page has no public feed. The section does not affect the exit code, which still covers Claude and OpenAI.
 
 ## Reading the display
 

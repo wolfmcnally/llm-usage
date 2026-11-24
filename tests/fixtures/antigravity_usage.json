@@ -1,0 +1,29 @@
+{
+  "conversation_id": "fixture-conversation",
+  "status": "SUCCESS",
+  "response": "Fixture Models\tWeekly Limit Remaining\t75%\t2030-01-07T00:00:00Z\n",
+  "duration_seconds": 0.1,
+  "num_turns": 0,
+  "usage": {"input_tokens": 0, "output_tokens": 0, "thinking_tokens": 0,
+            "cache_read_tokens": 0, "total_tokens": 0},
+  "command": {
+    "name": "usage",
+    "data": {
+      "description": "Fixture: models in a group share a weekly and a 5-hour limit.",
+      "groups": [
+        {"name": "Fixture Models", "description": "Models within this group: Fixture A",
+         "buckets": [
+           {"id": "fixture-5h", "name": "Five Hour Limit Remaining", "window": "5h",
+            "remaining_fraction": 0.4, "reset_time": "2030-01-01T05:00:00Z"},
+           {"id": "fixture-weekly", "name": "Weekly Limit Remaining", "window": "weekly",
+            "remaining_fraction": 0.75, "reset_time": "2030-01-07T00:00:00Z"}]},
+        {"name": "Partner Models", "description": "Models within this group: Fixture B",
+         "buckets": [
+           {"id": "partner-weekly", "name": "Weekly Limit Remaining", "window": "weekly",
+            "remaining_fraction": 1, "reset_time": "2030-01-07T00:00:00Z"},
+           {"id": "partner-5h", "name": "Five Hour Limit Remaining", "window": "5h",
+            "remaining_fraction": null, "reset_time": "2030-01-01T05:00:00Z"}]}
+      ]
+    }
+  }
+}
