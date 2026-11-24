@@ -1590,7 +1590,7 @@ class AntigravityTests(unittest.TestCase):
             view = llm_usage.antigravity_view(agy_snapshot())
         self.assertTrue(view["ok"])
         self.assertEqual((view["display"]["title"], view["display"]["plan"]),
-                         ("GOOGLE ANTIGRAVITY", "Tier unavailable"))
+                         ("GOOGLE ANTIGRAVITY", ""))
         rows = view["display"]["rows"]
         self.assertEqual(
             [(r.get("text") or r["label"], r.get("utilization"))
@@ -1704,8 +1704,10 @@ class LegendPlacementTests(unittest.TestCase):
         plain = [llm_usage.ANSI_RE.sub("", line) for line in lines]
         self.assertTrue(plain[0].startswith("Used:"))
         self.assertTrue(plain[0].endswith(f"v{llm_usage.__version__}"))
-        self.assertIn("GOOGLE ANTIGRAVITY  Tier unavailable",
-                      [line[:36] for line in plain])
+        header = next(line for line in plain
+                      if line.startswith("GOOGLE ANTIGRAVITY"))
+        self.assertTrue(header.startswith("GOOGLE ANTIGRAVITY  "))
+        self.assertNotIn("Tier", header)
         self.assertFalse(any("ANTIGRAVITY" in line for line in without))
         self.assertFalse(any(line.startswith("Used:")
                              for line in plain[1:]))

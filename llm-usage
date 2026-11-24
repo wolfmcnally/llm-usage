@@ -2803,8 +2803,9 @@ def antigravity_view(snapshot: dict) -> dict:
                        snapshot.get("age"))
     display: dict[str, Any] = {
         # agy reports no account tier through a supported read-only
-        # surface, so the header says so instead of guessing one.
-        "title": "GOOGLE ANTIGRAVITY", "plan": "Tier unavailable",
+        # surface, so the plan stays blank rather than guessed; both
+        # renderers omit an empty plan.
+        "title": "GOOGLE ANTIGRAVITY", "plan": "",
         "notices": [], "service": None, "error": None, "alerts": [],
         "extras": [], "advice": [], "rows": [], "summary": None,
     }
